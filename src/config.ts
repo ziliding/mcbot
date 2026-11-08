@@ -1,3 +1,7 @@
+import type { CerebellumConfig } from './cerebellum.js'
+import type { JevConfig } from './jev.js'
+import type { TriageConfig } from './triage.js'
+
 function env (name: string, fallback?: string): string {
   const v = process.env[name]
   if (v !== undefined && v !== '') return v
@@ -20,6 +24,17 @@ export interface MatrixConfig {
   ignorePattern: RegExp | null
 }
 
+function num (name: string, fallback: number): number {
+  const v = Number(process.env[name] ?? '')
+  return process.env[name] !== undefined && process.env[name] !== '' && Number.isFinite(v) ? v : fallback
+}
+
+function flag (name: string, fallback: boolean): boolean {
+  const v = (process.env[name] ?? '').toLowerCase()
+  if (v === '') return fallback
+  return !['0', 'false', 'no', 'off'].includes(v)
+}
+
 export interface Config {
   mc: { host: string, port: number, username: string, version: string }
   /** Player that come/follow/look target when no name is given. */
@@ -27,6 +42,10 @@ export interface Config {
   matrix: MatrixConfig | null
   /** MCP over Streamable HTTP; null when MCP_TOKEN is unset (server stays off). */
   mcp: { port: number, token: string } | null
+  /** Jev (TypeSafe); null when JEV_API is unset: cerebellum and triage stay off. */
+  jev: JevConfig | null
+  cerebellum: (CerebellumConfig & { enabled: boolean, plan: string | null })
+  triage: TriageConfig & { enabled: boolean }
 }
 
 export function loadConfig (): Config {
@@ -49,6 +68,35 @@ export function loadConfig (): Config {
           ignorePattern: process.env.MATRIX_IGNORE_REGEX ? new RegExp(process.env.MATRIX_IGNORE_REGEX, 'u') : null
         }
       : null,
-    mcp: process.env.MCP_TOKEN ? { port: Number(env('MCP_PORT', '3333')), token: process.env.MCP_TOKEN } : null
+    mcp: process.env.MCP_TOKEN ? { port: Number(env('MCP_PORT', '3333')), token: process.env.MCP_TOKEN } : null,
+    jev: process.env.JEV_API
+      ? {
+          apiKey: process.env.JEV_API,
+          model: env('JEV_MODEL', 'jev-1.14.0'),
+          pricePerMtok: num('JEV_PRICE_PER_MTOK', 0.042),
+          summaryEveryMs: num('JEV_USAGE_LOG_MS', 300_000)
+        }
+      : null,
+    cerebellum: {
+      enabled: flag('CEREBELLUM_ENABLED', true),
+      plan: process.env.CEREBELLUM_PLAN || null,
+      tickMs: num('CEREBELLUM_TICK_MS', 1000),
+      timeoutMs: num('CEREBELLUM_TIMEOUT_MS', 800),
+      switchP: num('CEREBELLUM_SWITCH_P', 0.6),
+      margin: num('CEREBELLUM_MARGIN', 0.25),
+      lowConfP: num('CEREBELLUM_LOW_CONF_P', 0.5),
+      lowConfTicks: num('CEREBELLUM_LOW_CONF_TICKS', 5),
+      infeasibleP: num('CEREBELLUM_INFEASIBLE_P', 0.2),
+      infeasibleTicks: num('CEREBELLUM_INFEASIBLE_TICKS', 3),
+      dangerP: num('CEREBELLUM_DANGER_P', 0.7),
+      maxStaleMs: num('CEREBELLUM_MAX_STALE_MS', 10_000),
+      escalateCooldownMs: num('CEREBELLUM_ESCALATE_COOLDOWN_MS', 120_000)
+    },
+    triage: {
+      enabled: flag('TRIAGE_ENABLED', true),
+      timeoutMs: num('TRIAGE_TIMEOUT_MS', 1000),
+      addressedP: num('TRIAGE_ADDRESSED_P', 0.6),
+      commandP: num('TRIAGE_COMMAND_P', 0.9)
+    }
   }
 }

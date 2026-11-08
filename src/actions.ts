@@ -62,6 +62,7 @@ export class Actions {
   private resumeFollow: { name: string, distance: number } | null = null
   private hands: Promise<unknown> = Promise.resolve()
   private handsQueued = 0
+  private readonly stopListeners: Array<() => void> = []
 
   constructor (private readonly body: Body, private readonly defaultPlayer: string) {
     body.on('spawn', (bot) => {
@@ -102,6 +103,16 @@ export class Actions {
   private claim (activity: string): number {
     if (this.slotReflex) throw new ActionError(`busy: ${this.slotReflex} (automatic reflex); try again in a few seconds`)
     return this.begin(activity)
+  }
+
+  /** Bumped whenever something claims the activity slot (read-only for observers). */
+  get currentGeneration (): number {
+    return this.generation
+  }
+
+  /** Called after every explicit stop (MCP tool, local chat command), not after cancel(). */
+  onStop (fn: () => void): void {
+    this.stopListeners.push(fn)
   }
 
   stillCurrent (gen: number): boolean {
@@ -245,7 +256,30 @@ export class Actions {
       return `${this.slotReflex} (automatic reflex, can't be stopped); will stay put afterwards instead of resuming`
     }
     this.begin('idle')
+    for (const fn of this.stopListeners) fn()
     return 'stopped'
+  }
+
+  /**
+   * Cancel the activity started under `gen` (the cerebellum dropping its own
+   * work). No-op if anything else has claimed the slot since; never pre-empts
+   * a reflex and does not notify stop listeners.
+   */
+  cancel (gen: number): boolean {
+    if (!this.stillCurrent(gen) || this.slotReflex) return false
+    this.begin('idle')
+    return true
+  }
+
+  /** Walk until at least `distance` blocks from `from` (e.g. away from a creeper). */
+  async fleeFrom (from: { x: number, y: number, z: number }, label: string, distance: number): Promise<string> {
+    const gen = this.claim(`fleeing ${label}`)
+    try {
+      const goal = new goals.GoalInvert(new goals.GoalNear(from.x, from.y, from.z, distance))
+      await this.goto(gen, goal, 15_000)
+      const d = this.bot().entity.position.distanceTo(this.bot().entity.position.clone().set(from.x, from.y, from.z))
+      return `fled to ${round(d)} blocks from ${label}`
+    } finally { this.finish(gen) }
   }
 
   async comeTo (playerName: string | undefined, range: number): Promise<string> {

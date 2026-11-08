@@ -1,7 +1,7 @@
 # uta-mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
-The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process) and M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) are done.** M3 was tested from the server console; the in-game check with a player is still to do (see below).
+The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) are done.** M5 (plan tools for Hermes, `[EVENT]` escalations into the room) is next.
 
 ## Layout
 
@@ -25,6 +25,7 @@ Source is in `src/` (strict TypeScript):
   4. Wear the best armor it carries.
 
   Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, movement tools answer `busy: …`, and an interrupted `go_to` or `mine_block` fails with `interrupted by fighting zombie`. An interrupted follow resumes by itself.
+- `cerebellum.ts` is the cerebellum (M4), see below. `jev.ts` wraps the TypeSafe SDK (timeouts, logging, cost), `plan.ts` holds the typed plan model, `worldstate.ts` builds the compact state Jev reads, and `triage.ts` decides which chat lines the body answers itself.
 - `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank.
 - `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools. It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
 
@@ -39,9 +40,86 @@ Also, don't use `bot.oxygenLevel` in 4.39: it is overwritten by any nearby entit
 
 Loop prevention: the bot ignores its own game messages (by uuid and by name) and its own Matrix messages. System, death and join lines are not forwarded.
 
+## Cerebellum (M4)
+
+The brain (Hermes) is slow and expensive; the reflexes are instant but dumb. The cerebellum sits between them: a ~1 Hz loop that asks **Jev** (TypeSafe's System One model, `jev-1.14.0`) one batched request per tick and turns the typed answers into `Actions` calls. It needs `JEV_API`; without it the cerebellum and triage switch off and the bot behaves as in M3.
+
+Each tick sends a compact world state (health/food as words, nearest hostile and how close, players, inventory summary, current activity and reflex, plan step with code-measured progress like "gathered 3 of 5, 2 more needed", last action and outcome) and four questions:
+- **Choice** `behavior`: `FOLLOW_PLAYER | COME_TO_PLAYER | GATHER | MOVE_TO | FLEE | EAT | IDLE`. Only the options that make sense this tick are offered, always in that order (e.g. `GATHER` only during a gather step, `FLEE` only with a creeper/warden within 10 blocks, `EAT` only when hungry with food). There is no `FIGHT` (that's the reflexes) and no `CRAFT` (no crafting verb yet).
+- **Noul** `step_done`, `step_feasible`, `danger`.
+
+Policy (all in code, thresholds via env):
+- Reflexes win: while one holds the activity slot, no call is made at all. An interrupted gather (`interrupted by fighting zombie`) is retried after the fight, never escalated.
+- Commands from outside win over the plan: if Hermes (MCP) or a local chat command holds the slot, the cerebellum only watches, and may interject `FLEE`/`EAT`. After fleeing from a follow, it follows again.
+- Switch only when the new behavior has p ≥ `CEREBELLUM_SWITCH_P` and beats the current one by `CEREBELLUM_MARGIN` (hysteresis); a high `danger` lowers the bar for `FLEE`/`EAT`.
+- Step completion and progress are measured by code (inventory delta, distance); Jev's `step_done` is logged as a second opinion (`cerebellum.done_disagree`).
+- Escalations (`cerebellum.escalate`, then the `onEvent` hook M5 will post to Matrix): top probability < `CEREBELLUM_LOW_CONF_P` for `CEREBELLUM_LOW_CONF_TICKS` ticks; the step judged infeasible for `CEREBELLUM_INFEASIBLE_TICKS` ticks or failing with "no more X nearby" / "player not online" (the plan pauses); a step failing twice; plan done. Same type + step at most once per `CEREBELLUM_ESCALATE_COOLDOWN_MS`.
+- Calls are skipped when nothing changed (bucketed fingerprint; re-asked every `CEREBELLUM_MAX_STALE_MS` while something runs), when idle with no plan, and while a reflex or an outside command has nothing to interject. Skips are counted in `jev.usage`.
+- Any explicit stop (chat or the MCP `stop` tool) pauses the plan.
+
+Plans are typed (`plan.ts`): `gather {block, count}`, `move_to {x, y?, z}`, `come_to_player {player?}`, `wait {seconds}`, held in memory with a step index. M5 adds `set_plan`/`get_plan`/`clear_plan` on top of `PlanStore`.
+
+### Chat triage
+
+Before a game chat line goes to Matrix, the body checks whether it is a bare **follow / come / stop / wait** command for the bot. A wrong "handled locally" means Hermes never sees the line, so it is conservative:
+1. A strict grammar must match first (after dropping fillers like "please", "mcbot", "me", "here"): no `?`, no negation, nothing else asked. "stop following me and chop trees" never goes local.
+2. Jev must agree: command probability ≥ `TRIAGE_COMMAND_P` (0.9) and "addressed to the bot" ≥ `TRIAGE_ADDRESSED_P` (0.6; 0.85 when other players are online and the bot isn't named).
+3. Jev slow (`TRIAGE_TIMEOUT_MS`) or down: the grammar alone decides (and only for a named bot when others are online).
+4. If the local action fails (e.g. `busy: fighting zombie`), the line is forwarded after all.
+
+Handled lines get a canned reply ("ok, following you") and are prepended to the next forwarded line as `[MC] (handled locally) steve: follow me → …`, so Hermes keeps the context without being woken. Every decision is logged as a `triage` event.
+
+### Running a test plan
+
+Without Hermes, either:
+- `CEREBELLUM_PLAN=logs docker compose up -d mcbot` loads a preset on spawn (`logs`: gather 5 `*_log`, then come back to the player; `logs_only`). It also accepts JSON: `{"goal":"…","steps":[{"kind":"gather","block":"*_log","count":5},{"kind":"come_to_player"}]}`.
+- In game chat: `!plan logs`, `!plan {json}`, `!plan show`, `!plan pause`, `!plan resume`, `!plan clear`. These lines are never forwarded.
+
+Watch it with `docker compose logs -f mcbot | grep -E 'cerebellum|plan|triage|jev.usage'`.
+
+### Jev cost and latency
+
+Jev bills input tokens only, $0.042 per million (`jev-1.14.0`, Nov 2026). Measured here: a cerebellum request is ~800 tokens and 100–330 ms (p50 ~150 ms); a triage request is ~520 tokens and ~130 ms.
+- Ceiling, a call every tick at 1 Hz: ~2.9 M tokens/h ≈ **$0.12/hour**.
+- Actual, with change detection: ~7 calls in 45 s of plan work (≈ $0.02/hour), and **zero** while idle with no plan.
+
+Each answer logs `jev.answer` (ms, model, tokens, usd, probabilities); `jev.usage` every `JEV_USAGE_LOG_MS` (5 min) logs the rolling last-hour requests/tokens/USD by purpose, totals, errors and skipped calls.
+
+### Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `JEV_API` | (unset) | TypeSafe API key. Unset = no cerebellum, no triage. |
+| `JEV_MODEL` | `jev-1.14.0` | Pinned model id (thresholds are tuned against it). |
+| `JEV_PRICE_PER_MTOK` | `0.042` | USD per million input tokens, for the cost log. |
+| `JEV_USAGE_LOG_MS` | `300000` | How often `jev.usage` is logged. |
+| `CEREBELLUM_ENABLED` | `true` | Set `false` to keep triage but not the loop. |
+| `CEREBELLUM_PLAN` | (unset) | Preset name or JSON plan loaded on first spawn. |
+| `CEREBELLUM_TICK_MS` | `1000` | Loop period. |
+| `CEREBELLUM_TIMEOUT_MS` | `800` | Per-call timeout (no retries). |
+| `CEREBELLUM_SWITCH_P` / `CEREBELLUM_MARGIN` | `0.6` / `0.25` | Switch threshold and hysteresis margin. |
+| `CEREBELLUM_LOW_CONF_P` / `CEREBELLUM_LOW_CONF_TICKS` | `0.5` / `5` | Low-confidence escalation. |
+| `CEREBELLUM_INFEASIBLE_P` / `CEREBELLUM_INFEASIBLE_TICKS` | `0.2` / `3` | Infeasible-step escalation. |
+| `CEREBELLUM_DANGER_P` | `0.7` | "In danger" threshold that lowers the bar for FLEE/EAT. |
+| `CEREBELLUM_MAX_STALE_MS` | `10000` | Re-ask at least this often while something runs. |
+| `CEREBELLUM_ESCALATE_COOLDOWN_MS` | `120000` | Dedupe window per escalation type + step. |
+| `TRIAGE_ENABLED` | `true` | Set `false` to forward all chat to Hermes. |
+| `TRIAGE_TIMEOUT_MS` | `1000` | Jev timeout before the grammar-only fallback. |
+| `TRIAGE_ADDRESSED_P` / `TRIAGE_COMMAND_P` | `0.6` / `0.9` | Triage thresholds. |
+
+## M4 check
+
+Verified on the server (difficulty easy), with a temporary 5-log column placed with `fill` and removed by the bot's mining:
+- `CEREBELLUM_PLAN=logs`: the bot chose `GATHER` (p 1.0) and dug 2 logs. A zombie summoned 3 blocks away interrupted it: the reflex fought, the gather failed as `interrupted by fighting zombie` (transient), and the next tick restarted it for the 3 missing logs. Step done by code at 5/5. Then `come_to_player` with steve offline → `step_infeasible` escalation and the plan paused. No `mcp.call` and no Hermes traffic during the run.
+- A (NoAI) creeper 4 blocks away: `FLEE` p 0.99, fled to 18 blocks, back to idle.
+- With a test client as steve: `!plan {come_to_player}` → walked over, `plan_done`. "follow me" → local, followed 11 → 2 blocks. "stop" and "mcbot, wait here" → local. When "follow me" arrived during a reflex fight it failed open and went to Hermes.
+- 19 tricky triage lines against live Jev: all bare commands local; "stop following me and chop some trees", "don't follow me", "follow me?", "wait what", "stop it lol", and an unnamed "stop" with another player online were forwarded.
+
+Still to check in game with a real player: a long plan with steve actually walking around, ordinary chat still reaching Hermes with the `(handled locally)` prefix, and Hermes reacting to it sensibly after `/new`.
+
 ## Setup
 
-1. Add the keys from `.env.example` to your `.env`. On a fresh checkout, copy it instead. Set `MC_EULA=TRUE` only after reading the EULA.
+1. Add the keys from `.env.example` to your `.env` (including `JEV_API` for the cerebellum). On a fresh checkout, copy it instead. Set `MC_EULA=TRUE` only after reading the EULA.
 2. Matrix (one time): run `scripts/matrix-setup.sh` from the repo root. The brain is a Hermes profile, `PERSONA`, which defaults to `nova`. To use another, run `PERSONA=luna scripts/matrix-setup.sh`. The script:
    - registers the body's **own**, persona-neutral account, `@mcbot:example.com`. It refuses any account a Hermes profile already uses, such as `@nova` or `@luna`.
    - creates an **unencrypted** room (the bridge can't read E2EE) and invites the persona (`@nova`) and, optionally, you.
