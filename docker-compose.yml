@@ -41,6 +41,8 @@ services:
       # Inside the compose network the server is reached by service name.
       MC_HOST: mc
       MC_PORT: "25565"
+      # Fixed inside the container; MCP_PORT in .env only changes the host side.
+      MCP_PORT: "3333"
       # Matrix homeserver (tuwunel shares the "tailscale" container's network
       # namespace in the matrix compose project).
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://tailscale:6167}
