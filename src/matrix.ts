@@ -159,9 +159,13 @@ export class MatrixBridge {
    */
   private isNoise (body: string): boolean {
     if (this.cfg.ignorePattern) return this.cfg.ignorePattern.test(body)
+    // Bubbles may quote the tool's arguments after an identifier-like label
+    // (`⚙️ mcp__minecraft__say: "全杀？…"`). The quoted text is not the reply,
+    // so its punctuation must not count.
+    const lines = body.split('\n').map((l) => l.trim()).filter(Boolean)
+      .map((l) => l.replace(/^((?:┊\s*)?\p{Extended_Pictographic}\uFE0F?\s+[\w.\-]+(?:\s*\(×\d+\))?)(?:\.\.\.|…)?:\s*["“'].*$/u, '$1'))
     // Truncated previews end in "..." / "…"; that is not sentence punctuation.
-    const text = body.replace(/(?:\.\.\.|…)(?=\s|$)/gu, '')
-    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
+    const text = lines.join('\n').replace(/(?:\.\.\.|…)(?=\s|$)/gu, '')
     return lines.length > 0 &&
       lines.every((l) => /^(?:┊\s*)?\p{Extended_Pictographic}\uFE0F?\s+\S/u.test(l)) &&
       !/[。！？，、!?]|[.,](?:\s|$)/u.test(text)
