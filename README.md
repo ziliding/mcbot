@@ -1,7 +1,7 @@
 # uta-mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
-The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done.** M6 (ops/observability: traces, reconnect hardening) is next.
+The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done, plus crafting, smelting and block placement (`craft`, `smelt`, `place_block`, and `craft`/`smelt` plan steps).** M6 (ops/observability: traces, reconnect hardening) is next.
 
 ## Layout
 
@@ -26,7 +26,8 @@ Source is in `src/` (strict TypeScript):
 
   Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, movement tools answer `busy: …`, and an interrupted `go_to` or `mine_block` fails with `interrupted by fighting zombie`. An interrupted follow resumes by itself.
 - `cerebellum.ts` is the cerebellum (M4), see below. `jev.ts` wraps the TypeSafe SDK (timeouts, logging, cost), `plan.ts` holds the typed plan model, `worldstate.ts` builds the compact state Jev reads, and `triage.ts` decides which chat lines the body answers itself.
-- `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank.
+- `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank, and what a mined block drops (`iron_ore` → `raw_iron`) for gather progress.
+- `crafting.ts` is crafting and smelting knowledge, pure: the smelting and fuel tables, and the crafting resolver (see *Making things*).
 - `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools, plus the plan tools (M5). It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
 - `events.ts` posts `[EVENT] …` escalations to the room (coalesced, rate-limited); `lookout.ts` spots rare ores for "notable find" events.
 
@@ -46,7 +47,7 @@ Loop prevention: the bot ignores its own game messages (by uuid and by name) and
 The brain (Hermes) is slow and expensive; the reflexes are instant but dumb. The cerebellum sits between them: a ~1 Hz loop that asks **Jev** (TypeSafe's System One model, `jev-1.14.0`) one batched request per tick and turns the typed answers into `Actions` calls. It needs `JEV_API`; without it the cerebellum and triage switch off and the bot behaves as in M3.
 
 Each tick sends a compact world state (health/food as words, nearest hostile and how close, players, inventory summary, current activity and reflex, plan step with code-measured progress like "gathered 3 of 5, 2 more needed", last action and outcome) and four questions:
-- **Choice** `behavior`: `FOLLOW_PLAYER | COME_TO_PLAYER | GATHER | MOVE_TO | FLEE | EAT | IDLE`. Only the options that make sense this tick are offered, always in that order (e.g. `GATHER` only during a gather step, `FLEE` only with a creeper/warden within 10 blocks, `EAT` only when hungry with food). There is no `FIGHT` (that's the reflexes) and no `CRAFT` (no crafting verb yet).
+- **Choice** `behavior`: `FOLLOW_PLAYER | COME_TO_PLAYER | GATHER | CRAFT | SMELT | MOVE_TO | FLEE | EAT | IDLE`. Only the options that make sense this tick are offered, always in that order (e.g. `GATHER` only during a gather step, `FLEE` only with a creeper/warden within 10 blocks, `EAT` only when hungry with food). There is no `FIGHT` (that's the reflexes). `CRAFT` and `SMELT` were added later (see *Making things*).
 - **Noul** `step_done`, `step_feasible`, `danger`.
 
 Policy (all in code, thresholds via env):
@@ -58,7 +59,7 @@ Policy (all in code, thresholds via env):
 - Calls are skipped when nothing changed (bucketed fingerprint; re-asked every `CEREBELLUM_MAX_STALE_MS` while something runs), when idle with no plan, and while a reflex or an outside command has nothing to interject. Skips are counted in `jev.usage`.
 - Any explicit stop (chat or the MCP `stop` tool) pauses the plan.
 
-Plans are typed (`plan.ts`): `gather {block, count}`, `move_to {x, y?, z}`, `come_to_player {player?}`, `wait {seconds}`, held in memory with a step index. The zod schemas in `plan.ts` are the single source of truth: the MCP tool schema, `!plan {json}` and `CEREBELLUM_PLAN` all parse with them. Hermes writes plans (M5, below); code owns the step index.
+Plans are typed (`plan.ts`): `gather {block, count}`, `craft {item, count}`, `smelt {item, count, fuel?}`, `move_to {x, y?, z}`, `come_to_player {player?}`, `wait {seconds}`, held in memory with a step index. The zod schemas in `plan.ts` are the single source of truth: the MCP tool schema, `!plan {json}` and `CEREBELLUM_PLAN` all parse with them. Hermes writes plans (M5, below); code owns the step index.
 
 ### Chat triage
 
@@ -115,6 +116,7 @@ Each answer logs `jev.answer` (ms, model, tokens, usd, probabilities); `jev.usag
 - `set_plan {goal, steps[]}`: replaces any plan, takes over from a running follow/go_to (never from a reflex), returns the plan summary. Refused when the cerebellum is off (no `JEV_API`).
   - Steps are validated against the zod union. Unknown kinds or fields give a readable error (`unknown step kind; \`kind\` must be one of gather, move_to, come_to_player, wait at steps[0].kind`).
   - Gather blocks are checked against the 26.1 block registry (minecraft-data, so it works while the bot is offline), with suggestions: `"coal" is not a Minecraft block id; did you mean coal_ore, coal_block, deepslate_coal_ore? (gather mines the block, not the item it drops)`.
+- Craft items are checked against the item registry (`"iron_ingot" is smelted (or mined), not crafted: use a smelt step with raw_iron / iron_ore / deepslate_iron_ore`), smelt items against the smelting table.
 - `get_plan`: goal, status, `step: "1/2"`, current step, code-measured progress (`gathered 3 of 5, 2 more needed`), pause reason, all steps. `get_state` includes the same object as `plan`.
 - `clear_plan`: drops the plan and cancels its running work.
 
@@ -151,6 +153,45 @@ Loop safety is unchanged: the bridge ignores its own Matrix messages, so `[EVENT
 | `EVENT_FIND_EVERY_MS` | `10000` | Scan period. |
 
 After changing the MCP tool set, send `/new` in the room so Hermes's session picks up the new tools.
+
+## Making things (crafting, smelting, placing)
+
+Three verbs in `actions.ts`, as MCP tools and as plan steps. Each takes the activity slot (`crafting 1 wooden_pickaxe`, `smelting 3 iron_ingot`, `placing torch`), so a reflex pre-empts it (`interrupted by fighting zombie`) and the cerebellum may interject FLEE.
+
+- **`craft {item, count}`**: crafts `count` more of an item id (`*_planks` picks a wood the bag can make).
+  - `crafting.ts` `resolveCraft` plans the `bot.craft` calls on a simulated inventory. It makes missing intermediates up to 3 levels deep (log → planks → sticks → pickaxe). Ingredients are reserved as they are resolved, so planks used for sticks are not counted again for the pickaxe. Of the per-wood recipe variants, it prefers the one the bag can already satisfy.
+  - Smelted or mined items (ingots, coal, diamonds) are base materials, never "crafted" from their storage block.
+  - 3×3 recipes use a crafting table within 16 blocks (it walks over), or it crafts one from planks and places it next to the bot.
+  - On failure: `can't craft 1 iron_pickaxe: need 1 more iron_ingot (have 2); have: …`.
+- **`smelt {item, count, fuel?}`**: `item` is the input (`raw_iron`, `*_log`) or the output (`iron_ingot`, `charcoal`).
+  - Uses a furnace within 16 blocks, or crafts one from 8 cobblestone (through `craft`, so a table is made if needed) and places it.
+  - Fuel is one type from the bag, best first: coal, charcoal, planks, logs, sticks. It never burns the input itself (no logs as fuel when making charcoal).
+  - It loads input and fuel, waits (10 s per item + slack), and takes the output.
+  - Re-entry is safe: matching output already in the furnace is collected first, and matching input already loaded counts.
+  - The MCP tool caps `count` at 24 (Hermes's 300 s tool timeout). A plan smelt step runs in loads of 24.
+- **`place_block {item, x?, y?, z?}`**: places at the given cell (it walks into reach with `GoalPlaceBlock`), or at the nearest free cell with solid ground 1–3 blocks away.
+  - It never places into a cell a player, mob or the bot stands in, and never against a block that opens a screen (tables, furnaces, chests, doors…).
+  - Flowers are not replaceable; grass is.
+- **Recipe data:** minecraft-data 3.119 has the 26.1 crafting recipes (planks, stick, crafting_table, wooden_pickaxe, furnace, torch all present). It has **no furnace recipes**, so `crafting.ts` carries a typed smelting table (ores and raw metals → ingots, logs → charcoal, sand → glass, cobblestone → stone, raw meat/fish → cooked, …) and a fuel table.
+- **26.1 inventory quirk:** after a 2×2 inventory craft, mineflayer 4.39 leaves the last click unconfirmed. The next craft can start from a wrong inventory model and hang: logs → planks → crafting_table timed out about 1 run in 2. `craft` now asks the server for the full inventory state before and after each 2×2 craft (`bot._syncWindow`, mineflayer's own no-op click). On a failure it also empties the 2×2 grid and retries once.
+- **Gather progress counts drops:** a `gather iron_ore` step now completes on `raw_iron`, and `stone` on `cobblestone`. Before, those steps could never complete.
+
+Cerebellum: `CRAFT` and `SMELT` join the behavior choice (GATHER/CRAFT/SMELT/MOVE_TO map 1:1 to the step kinds). Step completion is the code-measured inventory delta of the item (craft), or of the output (smelt: `iron_ingot` for `raw_iron`). A craft or smelt that fails for missing materials or fuel pauses the plan at once with `step stuck` (retrying won't conjure materials). `!plan pickaxe` is a preset: gather 3 `*_log`, then craft a `wooden_pickaxe`.
+
+## Crafting check
+
+Verified over MCP against the live bot (26.1, difficulty easy), with materials from `give mcbot …`:
+- craft `*_planks` 4 → `stick` 4 → `crafting_table` 1 → `place_block crafting_table` (auto spot) → `wooden_pickaxe` 1 at the placed table.
+- From 3 birch logs and no table within 16 blocks: `craft wooden_pickaxe` made planks, a table, sticks, placed the table and crafted the pickaxe in 2.1 s.
+- `smelt iron_ingot 3` with no furnace near: crafted a furnace from 8 cobblestone at the table, placed it, loaded 3 raw_iron + 1 coal, and 31 s later took 3 iron_ingot.
+  - A first attempt was interrupted when the cerebellum fled a creeper (`interrupted by fleeing creeper`). The placed furnace was reused on the retry.
+- Plan `gather 3 *_log → craft 1 wooden_pickaxe → craft 2 stick`: Jev chose `CRAFT` (p 0.99) for each craft step. Every step was completed by code, then `plan_done`.
+- Plan `smelt 2 raw_iron → craft 1 stone_pickaxe`: done.
+- Plan `craft 1 diamond_pickaxe`: paused at once with `can't craft 1 diamond_pickaxe: need 3 more diamond (have 0)`.
+- `set_plan` refused `craft iron_ingot`, `craft woden_pickaxe` and `smelt dirt` with readable errors.
+- `place_block torch` at explicit coordinates and at an auto spot. It refused an occupied cell (`-46 84 -2 is not empty (dirt)`) and an unsupported one (`nothing solid next to …`).
+
+Test blocks were removed with `setblock … air` and the bot's inventory restored afterwards.
 
 ## M5 check
 

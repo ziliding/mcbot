@@ -2,6 +2,7 @@ import { Actions } from './actions.js'
 import { Body } from './body.js'
 import minecraftData from 'minecraft-data'
 import { Cerebellum } from './cerebellum.js'
+import { itemCatalog } from './crafting.js'
 import { loadConfig } from './config.js'
 import { EventReporter } from './events.js'
 import { Jev } from './jev.js'
@@ -191,8 +192,10 @@ body.on('playerChat', ({ player, text }) => {
 })
 
 // MCP tools for Hermes: same process, same bot.
-const blockNames = Object.keys(minecraftData(cfg.mc.version).blocksByName)
-const mcp = cfg.mcp ? startMcpServer({ actions, plans, cerebellum, blockNames }, cfg.mcp.port, cfg.mcp.token) : null
+const mcData = minecraftData(cfg.mc.version)
+const blockNames = Object.keys(mcData.blocksByName)
+const items = itemCatalog({ itemsArray: mcData.itemsArray, recipes: mcData.recipes as Record<string, unknown> })
+const mcp = cfg.mcp ? startMcpServer({ actions, plans, cerebellum, blockNames, items }, cfg.mcp.port, cfg.mcp.token) : null
 if (!cfg.mcp) log('mcp.disabled', { reason: 'MCP_TOKEN not set' })
 body.start()
 

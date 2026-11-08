@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { ActionError, blockPattern, type Actions } from './actions.js'
 import type { Cerebellum } from './cerebellum.js'
 import { log } from './log.js'
+import { checkCraftItem, checkSmeltItem, type ItemCatalog } from './crafting.js'
 import { PlanStepSchema, STEP_KINDS, checkGatherBlocks, describeStep, type PlanStore } from './plan.js'
 
 export interface McpDeps {
@@ -15,6 +16,8 @@ export interface McpDeps {
   cerebellum: Cerebellum | null
   /** Every block id of the server version, for validating gather steps while offline too. */
   blockNames: string[]
+  /** Item ids and which have crafting recipes, for validating craft steps. */
+  items: ItemCatalog
 }
 
 /** The plan as Hermes sees it: goal, status, which step, code-measured progress. */
@@ -65,10 +68,13 @@ function buildServer (d: McpDeps): McpServer {
       'Give your body a multi-step job that it carries out on its own, step by step, while you stay free to talk. Replaces any current plan and takes over from a running follow/go_to.',
       `Step kinds (\`kind\`): ${STEP_KINDS.join(', ')}.`,
       '- gather {block, count}: mine `count` more blocks of a Minecraft BLOCK id and pick up the drops, e.g. {"kind":"gather","block":"*_log","count":10} (any wood). Name the block, not the drop: coal_ore not coal, stone (drops cobblestone).',
+      '- craft {item, count}: craft `count` more of a Minecraft ITEM id, e.g. {"kind":"craft","item":"wooden_pickaxe","count":1}. Planks, sticks and a crafting table are made on the way from logs/planks carried. Fails (pausing the plan) with what is missing.',
+      '- smelt {item, count, fuel?}: smelt in a furnace (one is crafted from 8 cobblestone and placed if none is near), e.g. {"kind":"smelt","item":"raw_iron","count":20}; item may be the input or the output (iron_ingot). 10 s per item; fuel from the inventory (coal, charcoal, planks, logs).',
       '- move_to {x, y?, z}: walk to coordinates.',
       '- come_to_player {player?}: walk back to a player (default: your usual companion).',
       '- wait {seconds}: stay put.',
-      'Use a plan for long or multi-step jobs ("get me 20 logs" = gather 20 *_log, then come_to_player), so you are not blocked for minutes. Use the single tools (mine_block, come_to_player, follow_player...) for quick one-shot actions.',
+      'Mining ore needs the right pickaxe (iron_ore needs stone_pickaxe or better; stone needs any pickaxe), and gather counts the drop (iron_ore -> raw_iron, stone -> cobblestone).',
+      'Use a plan for long or multi-step jobs ("get me 20 logs" = gather 20 *_log, then come_to_player; "20 iron ingots" = gather 20 iron_ore, smelt 20 raw_iron, come_to_player), so you are not blocked for minutes. Use the single tools (mine_block, come_to_player, follow_player...) for quick one-shot actions.',
       'Progress and completion are measured by the body itself. When the plan finishes, or a step gets stuck (nothing left nearby, player offline, keeps failing), an [EVENT] message arrives in the room: react then, no need to poll. A stuck step pauses the plan; send a new plan or clear_plan.',
       'Fights, eating and escaping water/lava still happen by reflex; a step interrupted by them resumes by itself. A "stop" from the player pauses the plan.'
     ].join('\n'),
@@ -79,6 +85,10 @@ function buildServer (d: McpDeps): McpServer {
   }, async (args) => run('set_plan', args, () => {
     if (!d.cerebellum) throw new ActionError('plans are off on this body (no cerebellum: JEV_API unset); use the single tools like mine_block instead')
     const errors = checkGatherBlocks(args.steps, d.blockNames, blockPattern)
+    args.steps.forEach((st, i) => {
+      const err = st.kind === 'craft' ? checkCraftItem(st.item, d.items) : st.kind === 'smelt' ? checkSmeltItem(st.item) : null
+      if (err) errors.push(`steps.${i}.item: ${err}`)
+    })
     if (errors.length) throw new ActionError(errors.join('\n'))
     // Take over from an outside activity (a follow, go_to...), which the
     // cerebellum would otherwise leave alone, including a follow a running
@@ -127,6 +137,29 @@ function buildServer (d: McpDeps): McpServer {
     description: 'Find the nearest blocks of a type, walk to them, break them and pick up the drops. Use Minecraft ids, e.g. oak_log (chop a tree), birch_log, stone, coal_ore. Waits until done.',
     inputSchema: { block: z.string().min(1), count: z.number().int().min(1).max(64).default(1), max_distance: z.number().int().min(4).max(64).default(32) }
   }, async (args) => run('mine_block', args, () => a.mineBlock(args.block, args.count, args.max_distance)))
+
+  s.registerTool('craft', {
+    description: 'Craft items from your inventory. Makes missing intermediates itself (logs -> planks -> sticks -> wooden_pickaxe). 3x3 recipes use a crafting table within 16 blocks, or it crafts one from planks and places it next to you. Use Minecraft item ids (stick, crafting_table, wooden_pickaxe, stone_pickaxe, furnace, torch, chest); `*_planks` = planks of whatever wood you carry. On failure it says exactly what is missing. Ingots/charcoal/glass are smelted, not crafted: use smelt. Waits until done.',
+    inputSchema: { item: z.string().min(1), count: z.number().int().min(1).max(64).default(1).describe('How many items to end up with MORE than now (e.g. 4 sticks).') }
+  }, async (args) => run('craft', args, () => a.craft(args.item, args.count)))
+
+  s.registerTool('smelt', {
+    description: 'Smelt items in a furnace and take the results: raw_iron -> iron_ingot, raw_gold, raw_copper, *_log -> charcoal, sand -> glass, cobblestone -> stone, raw meat/fish -> cooked. `item` may be the input (raw_iron) or the output (iron_ingot). Uses a furnace within 16 blocks, or crafts one from 8 cobblestone and places it. Fuel comes from your inventory (coal, charcoal, planks, logs) unless you name one. Takes 10 s per item and waits until done (max 24 per call; for more use a plan smelt step).',
+    inputSchema: {
+      item: z.string().min(1),
+      count: z.number().int().min(1).max(24).default(1),
+      fuel: z.string().min(1).optional().describe('Fuel item id, e.g. coal or *_planks; omit to pick automatically.')
+    }
+  }, async (args) => run('smelt', args, () => a.smelt(args.item, args.count, args.fuel)))
+
+  s.registerTool('place_block', {
+    description: 'Place a block from your inventory (torch, crafting_table, furnace, cobblestone to plug a hole...). Give x y z for an exact spot (it walks into reach), or omit them for a free spot with solid ground right next to you.',
+    inputSchema: { item: z.string().min(1), x: z.number().optional(), y: z.number().optional(), z: z.number().optional() }
+  }, async (args) => run('place_block', args, () => {
+    const { x, y, z: zz } = args
+    if ((x === undefined) !== (y === undefined) || (x === undefined) !== (zz === undefined)) throw new ActionError('give all of x, y, z, or none')
+    return a.placeBlock(args.item, x !== undefined && y !== undefined && zz !== undefined ? { x, y, z: zz } : undefined)
+  }))
 
   s.registerTool('look_at_player', {
     description: 'Turn to face a player.',

@@ -40,7 +40,7 @@ export interface WorldState {
 }
 
 const TOOL_RE = /(_pickaxe|_axe|_shovel|_hoe|_sword)$|^(shears|bow|crossbow|fishing_rod|flint_and_steel|shield|trident)$/
-const MATERIAL_RE = /(_log|_planks|_ingot|_ore)$|^(cobblestone|stone|dirt|coal|charcoal|stick|diamond|emerald|torch|crafting_table|furnace|string|gunpowder|bone|arrow)$/
+const MATERIAL_RE = /(_log|_planks|_ingot|_ore)$|^raw_|^(cobblestone|cobbled_deepslate|sand|glass|stone|dirt|coal|charcoal|stick|diamond|emerald|torch|crafting_table|furnace|string|gunpowder|bone|arrow)$/
 
 export function howClose (d: number | null): string {
   if (d === null) return 'out of sight'

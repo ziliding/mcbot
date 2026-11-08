@@ -4,22 +4,27 @@ import type { Body } from './body.js'
 import type { Jev } from './jev.js'
 import { log } from './log.js'
 import { describeStep, type PlanStep, type PlanStore } from './plan.js'
+import { smeltSpec } from './crafting.js'
+import { countGathered } from './items.js'
 import { AVOID_MOBS, buildWorldState, countMatching, fingerprint, howClose, type LastAction, type StepProgress, type WorldState } from './worldstate.js'
 
 /**
  * Behaviors the cerebellum can choose, in a fixed order (Jev's Choice options
  * keep this order every tick). Each one has an executor below that drives
  * `Actions`. There is no FIGHT: fighting belongs to the reflexes, and the
- * cerebellum never runs while a reflex holds the activity slot. No CRAFT yet:
- * there is no crafting verb.
+ * cerebellum never runs while a reflex holds the activity slot. GATHER, CRAFT,
+ * SMELT and MOVE_TO map 1:1 to the plan step kinds gather, craft, smelt and
+ * move_to.
  */
-export const BEHAVIORS = ['FOLLOW_PLAYER', 'COME_TO_PLAYER', 'GATHER', 'MOVE_TO', 'FLEE', 'EAT', 'IDLE'] as const
+export const BEHAVIORS = ['FOLLOW_PLAYER', 'COME_TO_PLAYER', 'GATHER', 'CRAFT', 'SMELT', 'MOVE_TO', 'FLEE', 'EAT', 'IDLE'] as const
 export type Behavior = typeof BEHAVIORS[number]
 
 const DESCRIPTIONS: Record<Behavior, string> = {
   FOLLOW_PLAYER: 'Keep following the player, as the bot is already doing (see `activity`).',
   COME_TO_PLAYER: 'Walk back to the player (the current plan step, or the activity already running).',
   GATHER: 'Work on the current plan step: find and mine the blocks it names.',
+  CRAFT: 'Work on the current plan step: craft the item it names from the inventory (making planks, sticks or a crafting table on the way).',
+  SMELT: 'Work on the current plan step: smelt the items it names in a furnace and wait for the results.',
   MOVE_TO: 'Walk to the place the current plan step or the running activity names.',
   FLEE: 'Move away from the creeper or warden in `nearest_hostile` while it is close: the bot never fights these, so distance is the only defense. A creeper explodes when it gets near.',
   EAT: 'Stop briefly and eat: the food bar is low and the bot carries food.',
@@ -70,6 +75,8 @@ function behaviorOfActivity (activity: string): Behavior | null {
   if (activity.startsWith('coming to ')) return 'COME_TO_PLAYER'
   if (activity.startsWith('going to ')) return 'MOVE_TO'
   if (activity.startsWith('mining ')) return 'GATHER'
+  if (activity.startsWith('crafting ')) return 'CRAFT'
+  if (activity.startsWith('smelting ')) return 'SMELT'
   if (activity.startsWith('fleeing ')) return 'FLEE'
   return null
 }
@@ -182,9 +189,16 @@ export class Cerebellum {
     const bot = this.body.bot
     switch (step.kind) {
       case 'gather': {
-        const got = Math.max(0, countMatching(inventory, step.block) - this.baseline)
+        const got = Math.max(0, countGathered(inventory, step.block) - this.baseline)
         const left = Math.max(0, step.count - got)
         return { text: left === 0 ? `gathered ${got} of ${step.count}, complete` : `gathered ${got} of ${step.count}, ${left} more needed`, complete: left === 0 }
+      }
+      case 'craft':
+      case 'smelt': {
+        const got = Math.max(0, stepOutputCount(step, inventory) - this.baseline)
+        const left = Math.max(0, step.count - got)
+        const verb = step.kind === 'craft' ? 'crafted' : 'smelted'
+        return { text: left === 0 ? `${verb} ${got} of ${step.count}, complete` : `${verb} ${got} of ${step.count}, ${left} more needed`, complete: left === 0 }
       }
       case 'move_to': {
         const p = bot?.entity?.position
@@ -210,6 +224,8 @@ export class Cerebellum {
     if (!step) return null
     switch (step.kind) {
       case 'gather': return 'GATHER'
+      case 'craft': return 'CRAFT'
+      case 'smelt': return 'SMELT'
       case 'move_to': return 'MOVE_TO'
       case 'come_to_player': return 'COME_TO_PLAYER'
       case 'wait': return 'IDLE'
@@ -229,7 +245,7 @@ export class Cerebellum {
     if (key !== this.stepKey) {
       this.stepKey = key
       this.stepStartedAt = Date.now()
-      this.baseline = step?.kind === 'gather' ? countMatching(this.actions.state().inventory, step.block) : 0
+      this.baseline = step ? stepOutputCount(step, this.actions.state().inventory) : 0
       this.failures = 0
       this.infeasibleTicks = 0
       this.lowTicks = 0
@@ -391,8 +407,23 @@ export class Cerebellum {
           break
         case 'GATHER': {
           if (step?.kind !== 'gather') return
-          const got = Math.max(0, countMatching(this.actions.state().inventory, step.block) - this.baseline)
+          const got = Math.max(0, countGathered(this.actions.state().inventory, step.block) - this.baseline)
           promise = this.actions.mineBlock(step.block, Math.max(1, step.count - got), 48)
+          gen = this.actions.currentGeneration
+          break
+        }
+        case 'CRAFT': {
+          if (step?.kind !== 'craft') return
+          const got = Math.max(0, stepOutputCount(step, this.actions.state().inventory) - this.baseline)
+          promise = this.actions.craft(step.item, Math.max(1, step.count - got))
+          gen = this.actions.currentGeneration
+          break
+        }
+        case 'SMELT': {
+          if (step?.kind !== 'smelt') return
+          const got = Math.max(0, stepOutputCount(step, this.actions.state().inventory) - this.baseline)
+          // One furnace load at a time (10 s per item); the next tick continues.
+          promise = this.actions.smelt(step.item, Math.min(SMELT_CHUNK, Math.max(1, step.count - got)), step.fuel)
           gen = this.actions.currentGeneration
           break
         }
@@ -433,12 +464,32 @@ export class Cerebellum {
     if (transient) return
     const step = this.plans.active
     if (!step || stepIndex !== this.plans.stepIndex) return
-    if (/^dug \d+\/\d+ .*no more|^unknown block|is not online|no other player/.test(msg)) {
+    // Missing materials or fuel won't fix themselves by retrying.
+    if (/^dug \d+\/\d+ .*no more|^unknown (block|item)|is not online|no other player|^can't (craft|smelt)|^nothing came out/.test(msg)) {
       this.infeasible(step, msg)
     } else if (++this.failures >= 2) {
       this.plans.pause(`step failed twice: ${msg}`)
       this.emit({ type: 'step_failed', message: `${describeStep(step)} failed twice: ${msg}`, plan: this.plans.view()?.goal ?? null, step: describeStep(step) }, `failed:${this.stepKey}`)
     }
+  }
+}
+
+/** Furnace loads per SMELT run: 24 items = 4 minutes. */
+const SMELT_CHUNK = 24
+
+/**
+ * What a step's completion is measured in: gathered blocks plus their drops,
+ * crafted items (`*` wildcard), or the smelt output (iron_ingot for raw_iron).
+ */
+export function stepOutputCount (step: PlanStep, inventory: Record<string, number>): number {
+  switch (step.kind) {
+    case 'gather': return countGathered(inventory, step.block)
+    case 'craft': return countMatching(inventory, step.item)
+    case 'smelt': {
+      const out = smeltSpec(step.item)?.output
+      return out ? inventory[out] ?? 0 : 0
+    }
+    default: return 0
   }
 }
 

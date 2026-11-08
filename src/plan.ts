@@ -11,7 +11,7 @@ import { z } from 'zod'
  * step with what Hermes can send.
  */
 
-export const STEP_KINDS = ['gather', 'move_to', 'come_to_player', 'wait'] as const
+export const STEP_KINDS = ['gather', 'craft', 'smelt', 'move_to', 'come_to_player', 'wait'] as const
 
 const coord = (axis: string): z.ZodNumber => z.number({ error: `${axis} must be a number (block coordinate)` }).finite()
 
@@ -22,6 +22,23 @@ export const GatherStepSchema = z.strictObject({
   count: z.number({ error: 'gather needs `count`: how many blocks to mine (1-256)' }).int().min(1).max(256)
     .describe('How many MORE blocks to mine (counted from what is already carried).')
 }).describe('Mine blocks nearby (searches about 48 blocks around the body) and pick up the drops.')
+
+export const CraftStepSchema = z.strictObject({
+  kind: z.literal('craft'),
+  item: z.string({ error: 'craft needs `item`: a Minecraft item id such as stick, crafting_table, wooden_pickaxe' }).min(1)
+    .describe('Minecraft ITEM id to craft, e.g. stick, crafting_table, wooden_pickaxe, stone_pickaxe, furnace, torch. *_planks = planks of any wood.'),
+  count: z.number({ error: 'craft needs `count`: how many items to make (1-64)' }).int().min(1).max(64)
+    .describe('How many MORE items to have than when the step starts.')
+}).describe('Craft items; missing intermediates (planks, sticks, a crafting table) are made from what is carried.')
+
+export const SmeltStepSchema = z.strictObject({
+  kind: z.literal('smelt'),
+  item: z.string({ error: 'smelt needs `item`: what to smelt (raw_iron) or what to make (iron_ingot)' }).min(1)
+    .describe('The input (raw_iron, raw_gold, *_log, sand, beef) or the output (iron_ingot, charcoal, glass, cooked_beef).'),
+  count: z.number({ error: 'smelt needs `count`: how many items to make (1-64)' }).int().min(1).max(64)
+    .describe('How many MORE output items to have than when the step starts.'),
+  fuel: z.string().min(1).optional().describe('Fuel item id (coal, charcoal, *_planks); omit to pick from the inventory.')
+}).describe('Smelt in a furnace nearby, or one crafted from 8 cobblestone and placed; 10 s per item.')
 
 export const MoveToStepSchema = z.strictObject({
   kind: z.literal('move_to'),
@@ -40,7 +57,7 @@ export const WaitStepSchema = z.strictObject({
   seconds: z.number({ error: 'wait needs `seconds` (1-600)' }).min(1).max(600)
 }).describe('Stay where you are for a while.')
 
-export const PlanStepSchema = z.discriminatedUnion('kind', [GatherStepSchema, MoveToStepSchema, ComeToPlayerStepSchema, WaitStepSchema], {
+export const PlanStepSchema = z.discriminatedUnion('kind', [GatherStepSchema, CraftStepSchema, SmeltStepSchema, MoveToStepSchema, ComeToPlayerStepSchema, WaitStepSchema], {
   error: (iss) => iss.code === 'invalid_union' ? `unknown step kind; \`kind\` must be one of ${STEP_KINDS.join(', ')}` : undefined
 })
 
@@ -81,6 +98,13 @@ export const PRESET_PLANS: Record<string, Plan> = {
   logs_only: {
     goal: 'gather 5 logs',
     steps: [{ kind: 'gather', block: '*_log', count: 5 }]
+  },
+  pickaxe: {
+    goal: 'gather 3 logs and make a wooden pickaxe',
+    steps: [
+      { kind: 'gather', block: '*_log', count: 3 },
+      { kind: 'craft', item: 'wooden_pickaxe', count: 1 }
+    ]
   }
 }
 
@@ -134,6 +158,8 @@ export function checkGatherBlocks (steps: PlanStep[], blockNames: string[], patt
 export function describeStep (s: PlanStep): string {
   switch (s.kind) {
     case 'gather': return `gather ${s.count} ${s.block}`
+    case 'craft': return `craft ${s.count} ${s.item}`
+    case 'smelt': return `smelt ${s.count} ${s.item}${s.fuel ? ` with ${s.fuel}` : ''}`
     case 'move_to': return `walk to ${s.x} ${s.y ?? '~'} ${s.z}`
     case 'come_to_player': return `come back to ${s.player ?? 'the player'}`
     case 'wait': return `wait ${s.seconds}s`

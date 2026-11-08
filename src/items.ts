@@ -113,3 +113,27 @@ export function ownOxygen (bot: Bot): number {
   const raw = idx >= 0 ? (bot.entity?.metadata as unknown[] | undefined)?.[idx] : undefined
   return typeof raw === 'number' ? Math.round(raw / 15) : 20
 }
+
+/** What mining a block puts in the inventory, where it isn't the block itself. */
+const BLOCK_DROPS: Record<string, string> = {
+  stone: 'cobblestone', deepslate: 'cobbled_deepslate', grass_block: 'dirt', clay: 'clay_ball',
+  coal_ore: 'coal', deepslate_coal_ore: 'coal', iron_ore: 'raw_iron', deepslate_iron_ore: 'raw_iron',
+  gold_ore: 'raw_gold', deepslate_gold_ore: 'raw_gold', copper_ore: 'raw_copper', deepslate_copper_ore: 'raw_copper',
+  diamond_ore: 'diamond', deepslate_diamond_ore: 'diamond', emerald_ore: 'emerald', deepslate_emerald_ore: 'emerald',
+  redstone_ore: 'redstone', deepslate_redstone_ore: 'redstone', lapis_ore: 'lapis_lazuli', deepslate_lapis_ore: 'lapis_lazuli',
+  nether_quartz_ore: 'quartz', nether_gold_ore: 'gold_nugget', glowstone: 'glowstone_dust', snow_block: 'snowball'
+}
+
+/**
+ * Items in `inventory` that count as gathered for a block pattern (`*`
+ * wildcard): the block itself plus what it drops (iron_ore -> raw_iron,
+ * stone -> cobblestone). Gather progress and mine_block both use it.
+ */
+export function countGathered (inventory: Record<string, number>, block: string): number {
+  const re = new RegExp('^' + block.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[a-z_]*') + '$')
+  const names = new Set(Object.keys(inventory).filter((n) => re.test(n)))
+  for (const [b, drop] of Object.entries(BLOCK_DROPS)) if (re.test(b)) names.add(drop)
+  let n = 0
+  for (const name of names) n += inventory[name] ?? 0
+  return n
+}

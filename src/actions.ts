@@ -3,7 +3,10 @@ import type { Entity } from 'prismarine-entity'
 import type { Item } from 'prismarine-item'
 import pathfinderPkg from 'mineflayer-pathfinder'
 import type { Body } from './body.js'
-import { BAD_FOODS, armorSlot, armorUpgrades, bestFood, bestWeapon, findItems, ownOxygen, wornArmor } from './items.js'
+import type { Block } from 'prismarine-block'
+import type { Furnace } from 'mineflayer'
+import { SMELT_SECONDS, describeMissing, fuelRank, fuelUnits, resolveCraft, smeltSpec, wildcard, type CraftCall } from './crafting.js'
+import { BAD_FOODS, armorSlot, armorUpgrades, bestFood, bestWeapon, countGathered, findItems, ownOxygen, wornArmor } from './items.js'
 import { log } from './log.js'
 
 const { goals, Movements } = pathfinderPkg
@@ -157,9 +160,9 @@ export class Actions {
   }
 
   /** Run something that uses the held item, after any earlier one finishes. */
-  withHands<T> (what: string, fn: () => Promise<T>): Promise<T> {
+  withHands<T> (what: string, fn: () => Promise<T>, timeoutMs = 10_000): Promise<T> {
     this.handsQueued++
-    const run = this.hands.then(() => withTimeout(fn(), 10_000, `${what} took too long`))
+    const run = this.hands.then(() => withTimeout(fn(), timeoutMs, `${what} took too long`))
     const done = run.then(() => undefined, () => undefined).finally(() => { this.handsQueued-- })
     this.hands = done
     return run
@@ -343,8 +346,8 @@ export class Actions {
     const pattern = blockPattern(blockName)
     const ids = Object.values(bot.registry.blocksByName).filter((b) => pattern.test(b.name)).map((b) => b.id)
     if (ids.length === 0) throw new ActionError(`unknown block "${blockName}"; use Minecraft ids like oak_log, stone, iron_ore, or a wildcard like *_log`)
-    const isTarget = (name: string): boolean => pattern.test(name)
-    const have = (): number => bot.inventory.items().filter((i) => isTarget(i.name)).reduce((n, i) => n + i.count, 0)
+    // Count the drops too: iron_ore yields raw_iron, stone yields cobblestone.
+    const have = (): number => countGathered(this.state().inventory, blockName)
     const before = have()
     const gen = this.claim(`mining ${count} ${blockName}`)
     let dug = 0
@@ -509,6 +512,312 @@ export class Actions {
     return parts.length ? parts.join(', ') : 'nothing'
   }
 
+  // ---- making things: craft, smelt, place ----
+
+  /**
+   * Craft `count` more of `item` (`*` wildcard: *_planks picks a wood the
+   * inventory can make). Missing intermediates are crafted first (logs ->
+   * planks -> sticks), up to MAX_CRAFT_DEPTH deep. 3x3 recipes use a crafting
+   * table within 16 blocks, or one crafted from planks and placed next to the
+   * bot. Takes the activity slot; a reflex interrupts it.
+   */
+  async craft (item: string, count: number): Promise<string> {
+    this.bot()
+    const gen = this.claim(`crafting ${count} ${item}`)
+    try { return await this.craftIn(gen, item, count) } finally { this.finish(gen) }
+  }
+
+  private async craftIn (gen: number, item: string, count: number): Promise<string> {
+    const bot = this.bot()
+    const inv = this.state().inventory
+    const name = item.replace(/^minecraft:/, '').toLowerCase()
+    const re = wildcard(name)
+    const candidates = Object.keys(bot.registry.itemsByName).filter((n) => re.test(n))
+    if (candidates.length === 0) throw new ActionError(`unknown item "${item}"; use Minecraft item ids like stick, crafting_table, wooden_pickaxe, or *_planks`)
+    const smelted = smeltSpec(name)
+    if (smelted && smelted.output === name) throw new ActionError(`can't craft ${name}: it is smelted (or mined), not crafted; use smelt with ${smelted.inputs.join(' / ')}`)
+
+    let table = this.findTable(bot)
+    const hasTableItem = (inv.crafting_table ?? 0) > 0
+    let chosen: { item: string, calls: CraftCall[] } | null = null
+    let leastMissing: Map<string, number> | null = null
+    for (const c of candidates) {
+      // 2x2 first; if that can't do it and there's no table around, plan a table too.
+      let r = resolveCraft(bot, c, count, inv, !!table)
+      if (!r.ok && !table) r = resolveCraft(bot, c, count, inv, true, !hasTableItem)
+      if (r.ok) {
+        if (!chosen || r.calls.length < chosen.calls.length) chosen = { item: c, calls: r.calls }
+      } else if (!leastMissing || sum(r.missing) < sum(leastMissing)) leastMissing = r.missing
+    }
+    if (!chosen) {
+      const what = leastMissing && leastMissing.size ? describeMissing(leastMissing, inv) : 'a recipe'
+      throw new ActionError(`can't craft ${count} ${item}: need ${what}; have: ${this.inventoryList()}`)
+    }
+
+    const target = chosen.item
+    const before = inv[target] ?? 0
+    const notes: string[] = []
+    for (const call of chosen.calls) {
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      let tableBlock: Block | undefined
+      if (call.recipe.requiresTable) {
+        if (!table) {
+          table = await this.placeIn(gen, 'crafting_table')
+          notes.push(`placed a crafting_table at ${fmtPos(table.position)}`)
+        }
+        await this.reach(gen, table)
+        tableBlock = bot.blockAt(table.position) ?? undefined
+        if (tableBlock?.name !== 'crafting_table') throw new ActionError(`the crafting table at ${fmtPos(table.position)} is gone`)
+      }
+      // On 26.1 the last click of a 2x2 craft is unconfirmed, so the next craft
+      // can start from a wrong inventory model and hang. Sync before each
+      // craft; on a failure, empty the grid, sync again and retry once.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await this.withHands(`craft ${call.item}`, async () => {
+            await syncInventory(bot)
+            await bot.craft(call.recipe, call.times, tableBlock)
+            if (!tableBlock) await syncInventory(bot)
+          }, 6_000 + 400 * call.times)
+          break
+        } catch (e) {
+          await this.closeAnyWindow(bot)
+          await this.withHands('clear crafting grid', () => clearCraftingGrid(bot)).catch(() => {})
+          if (!this.stillCurrent(gen)) throw this.interrupted()
+          log('item.craft_retry', { item: call.item, attempt, error: errText(e) })
+          if (attempt >= 2) throw new ActionError(`crafting ${call.item} failed: ${errText(e)}`)
+        }
+      }
+      log('item.craft', { item: call.item, times: call.times, made: call.made, table: !!tableBlock })
+    }
+    const now = this.state().inventory[target] ?? 0
+    const made = new Map<string, number>()
+    for (const c of chosen.calls.slice(0, -1)) made.set(c.item, (made.get(c.item) ?? 0) + c.made)
+    const via = made.size ? ` (via ${[...made].map(([n, c]) => `${c} ${n}`).join(', ')})` : ''
+    return `crafted ${now - before} ${target}${via}, now have ${now}` + (notes.length ? `; ${notes.join('; ')}` : '')
+  }
+
+  private findTable (bot: Bot): Block | null {
+    const id = bot.registry.blocksByName.crafting_table?.id
+    return id === undefined ? null : bot.findBlock({ matching: id, maxDistance: 16 })
+  }
+
+  /** Walk until `block` is within reach. */
+  private async reach (gen: number, block: Block): Promise<void> {
+    const bot = this.bot()
+    if (bot.entity.position.offset(0, bot.entity.height, 0).distanceTo(block.position.offset(0.5, 0.5, 0.5)) <= 4) return
+    await this.goto(gen, new goals.GoalLookAtBlock(block.position, bot.world), 30_000)
+  }
+
+  private async closeAnyWindow (bot: Bot): Promise<void> {
+    if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch { /* already closed */ } }
+  }
+
+  /**
+   * Smelt `count` items in a furnace. `item` names the input (raw_iron, *_log)
+   * or the output (iron_ingot, charcoal). Uses a furnace within 16 blocks, or
+   * crafts one from cobblestone and places it. Fuel comes from the inventory
+   * (coal, charcoal, planks, logs, sticks, best first) unless `fuel` names one.
+   * Waits for the results (10 s per item) and takes them out.
+   */
+  async smelt (item: string, count: number, fuel?: string): Promise<string> {
+    const bot = this.bot()
+    const spec = smeltSpec(item)
+    if (!spec) throw new ActionError(`can't smelt "${item}": not in the smelting table (try raw_iron, raw_gold, raw_copper, *_log for charcoal, sand, cobblestone, raw meat)`)
+    // The input slot holds one item type: use the one carried most.
+    const totals = new Map<string, number>()
+    for (const it of bot.inventory.items()) if (spec.isInput(it.name)) totals.set(it.name, (totals.get(it.name) ?? 0) + it.count)
+    const gen = this.claim(`smelting ${count} ${item}`)
+    let furnace: Furnace | null = null
+    const notes: string[] = []
+    try {
+      let block = this.findFurnace(bot)
+      if (!block) {
+        if (findItems(bot, 'furnace').length === 0) {
+          // Only spend materials on a furnace when there is something to smelt.
+          if (totals.size === 0) throw new ActionError(`can't smelt ${item}: no ${spec.inputs.join(' / ')} in inventory; have: ${this.inventoryList()}`)
+          const out = await this.craftIn(gen, 'furnace', 1)
+          notes.push(out.replace(/^crafted/, 'made'))
+        }
+        block = await this.placeIn(gen, 'furnace')
+        notes.push(`placed a furnace at ${fmtPos(block.position)}`)
+      }
+      await this.reach(gen, block)
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      const f = await withTimeout(bot.openFurnace(block), 5_000, 'opening the furnace took too long')
+      furnace = f
+      const outputName = spec.output
+      const before = this.state().inventory[outputName] ?? 0
+      let collected = 0
+      let foreign = ''
+      const takeOut = async (): Promise<void> => {
+        const out = f.outputItem()
+        if (!out) return
+        const got = await this.withHands('take from furnace', () => f.takeOutput())
+        if (got.name === outputName) collected += got.count
+        else foreign = `${got.count} ${got.name}`
+      }
+      // Re-entry: output from an earlier run counts, matching input already in counts as loaded.
+      await takeOut()
+      const inSlot = f.inputItem()
+      let inputName = [...totals].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null
+      let loaded = 0
+      if (inSlot) {
+        if (!spec.isInput(inSlot.name)) throw new ActionError(`the furnace at ${fmtPos(block.position)} is busy with ${inSlot.count} ${inSlot.name}; wait for it or use another furnace`)
+        if (inputName !== inSlot.name && (totals.get(inSlot.name) ?? 0) === 0) inputName = inSlot.name
+        if (inputName === inSlot.name) loaded = inSlot.count
+        else throw new ActionError(`the furnace at ${fmtPos(block.position)} already holds ${inSlot.count} ${inSlot.name}; wait for it or smelt ${inSlot.name}`)
+      }
+      const wanted = Math.max(0, count - collected)
+      const add = inputName ? Math.min(totals.get(inputName) ?? 0, Math.max(0, wanted - loaded)) : 0
+      if (add + loaded === 0 && collected === 0) throw new ActionError(`can't smelt ${item}: no ${spec.inputs.join(' / ')} in inventory; have: ${this.inventoryList()}`)
+      const short = wanted - loaded - add
+      if (short > 0) notes.push(`only had ${add + loaded} to smelt (${short} short)`)
+
+      // Fuel: what's in the slot counts; top up with one fuel type.
+      const toSmelt = add + loaded
+      const fuelIn = f.fuelItem()
+      let units = fuelIn ? fuelIn.count * fuelUnits(fuelIn.name) : 0
+      if (f.fuel > 0) units += 1 // a burning flame covers about the item in progress
+      let fuelUsed = ''
+      if (toSmelt > units) {
+        const pick = this.pickFuel(bot, toSmelt - units, fuel, (n) => spec.isInput(n), fuelIn?.name)
+        if (fuelIn && fuelIn.name !== pick.name) await this.withHands('take fuel', () => f.takeFuel())
+        await this.withHands('load fuel', () => f.putFuel(pick.type, null, pick.count))
+        fuelUsed = `${pick.count} ${pick.name}`
+      }
+      if (add > 0 && inputName) {
+        const type = bot.registry.itemsByName[inputName]?.id
+        if (type === undefined) throw new ActionError(`unknown item ${inputName}`)
+        await this.withHands('load furnace', () => f.putInput(type, null, add))
+      }
+      log('item.smelt_start', { input: inputName, add, loaded, fuel: fuelUsed, output: outputName })
+
+      // Wait: ~10 s per item, plus slack. A reflex (or any newer command) ends the wait.
+      const deadline = Date.now() + (toSmelt * SMELT_SECONDS + 20) * 1000
+      while (collected < count && Date.now() < deadline) {
+        await sleep(1000)
+        if (!this.stillCurrent(gen)) throw this.interrupted()
+        await takeOut()
+        if (!f.inputItem() && !f.outputItem() && f.progress === 0) break
+      }
+      await takeOut()
+      // The inventory model lags while the furnace window is open: count ourselves.
+      const have = before + collected
+      const left = f.inputItem()?.count ?? 0
+      const msg = `smelted ${collected} ${outputName}${inputName ? ` from ${inputName}` : ''}, now have ${have}` +
+        (fuelUsed ? `; fuel ${fuelUsed}` : '') + (left ? `; ${left} still in the furnace at ${fmtPos(block.position)} (smelt again to collect)` : '') +
+        (foreign ? `; also took out ${foreign}` : '') + (notes.length ? `; ${notes.join('; ')}` : '')
+      if (collected === 0) throw new ActionError(`nothing came out: ${msg}`)
+      return msg
+    } finally {
+      if (furnace) { try { furnace.close() } catch { /* closed already */ } }
+      this.finish(gen)
+    }
+  }
+
+  private findFurnace (bot: Bot): Block | null {
+    const ids = ['furnace'].map((n) => bot.registry.blocksByName[n]?.id).filter((i): i is number => i !== undefined)
+    return bot.findBlock({ matching: ids, maxDistance: 16 })
+  }
+
+  /** One fuel type from the inventory that covers `units` items. */
+  private pickFuel (bot: Bot, units: number, wanted: string | undefined, isInput: (n: string) => boolean, inSlot: string | undefined): { name: string, type: number, count: number } {
+    const totals = new Map<string, { type: number, count: number }>()
+    const re = wanted ? wildcard(wanted) : null
+    for (const it of bot.inventory.items()) {
+      if (fuelUnits(it.name) === 0) continue
+      if (re ? !re.test(it.name) : isInput(it.name)) continue
+      const t = totals.get(it.name) ?? { type: it.type, count: 0 }
+      t.count += it.count
+      totals.set(it.name, t)
+    }
+    // Prefer topping up the fuel already in the slot, then the best fuel.
+    const ranked = [...totals].sort((a, b) => Number(b[0] === inSlot) - Number(a[0] === inSlot) || fuelRank(a[0]) - fuelRank(b[0]))
+    for (const [name, t] of ranked) {
+      const need = Math.ceil(units / fuelUnits(name))
+      if (t.count >= need) return { name, type: t.type, count: need }
+    }
+    const carried = ranked.map(([n, t]) => `${t.count} ${n}`).join(', ')
+    const coal = Math.ceil(units / 8)
+    throw new ActionError(`can't smelt: need fuel for ${units} items, e.g. ${coal} more coal/charcoal or ${Math.ceil(units / 1.5)} planks/logs; ${wanted ? `${wanted} carried` : 'fuel carried'}: ${carried || 'none'}`)
+  }
+
+  /** Place a block from the inventory at x y z, or on a free spot next to the bot. */
+  async placeBlock (item: string, at?: { x: number, y: number, z: number }): Promise<string> {
+    this.bot()
+    const gen = this.claim(`placing ${item}`)
+    try {
+      const b = await this.placeIn(gen, item, at)
+      return `placed ${b.name} at ${fmtPos(b.position)}`
+    } finally { this.finish(gen) }
+  }
+
+  private async placeIn (gen: number, itemName: string, at?: { x: number, y: number, z: number }): Promise<Block> {
+    const bot = this.bot()
+    const item = findItems(bot, itemName)[0]
+    if (!item) throw new ActionError(`no ${itemName} in inventory to place; have: ${this.inventoryList()}`)
+    if (!bot.registry.blocksByName[item.name]) throw new ActionError(`${item.name} is not a placeable block`)
+    let spot: { target: Vec3Like, ref: Block } | null
+    if (at) {
+      const target = bot.entity.position.clone().set(Math.floor(at.x), Math.floor(at.y), Math.floor(at.z))
+      const cur = bot.blockAt(target)
+      if (!cur) throw new ActionError(`${fmtPos(target)} is not loaded (too far away)`)
+      if (!isFree(cur)) throw new ActionError(`${fmtPos(target)} is not empty (${cur.name})`)
+      const ref = NEIGHBORS.map(([dx, dy, dz]) => bot.blockAt(target.offset(dx, dy, dz))).find((b): b is Block => !!b && isSolid(b))
+      if (!ref) throw new ActionError(`nothing solid next to ${fmtPos(target)} to place against`)
+      spot = { target, ref }
+    } else {
+      spot = this.freeSpot(bot)
+      if (!spot) throw new ActionError('no free spot with solid ground within 3 blocks to place on')
+    }
+    const { target, ref } = spot
+    const eye = (): number => bot.entity.position.offset(0, bot.entity.height, 0).distanceTo(target.offset(0.5, 0.5, 0.5))
+    if (eye() > 4.2) {
+      await this.goto(gen, new goals.GoalPlaceBlock(target, bot.world, { range: 4 } as unknown as ConstructorParameters<typeof goals.GoalPlaceBlock>[2]), 30_000) // the JS fills in the other options
+    }
+    if (!this.stillCurrent(gen)) throw this.interrupted()
+    if (overlapsEntity(bot, target)) throw new ActionError(`someone is standing at ${fmtPos(target)}`)
+    const face = target.minus(ref.position)
+    try {
+      await this.withHands('place', async () => {
+        await bot.equip(item, 'hand')
+        await bot.placeBlock(ref, face)
+      })
+    } catch (e) {
+      // placeBlock can time out waiting for the update although the block is there.
+      await sleep(300)
+      if (bot.blockAt(target)?.name !== item.name) {
+        if (!this.stillCurrent(gen)) throw this.interrupted()
+        throw new ActionError(`placing ${item.name} at ${fmtPos(target)} failed: ${errText(e)}`)
+      }
+    }
+    const placed = bot.blockAt(target)
+    if (!placed || isFree(placed)) throw new ActionError(`placing ${item.name} at ${fmtPos(target)} failed (still ${placed?.name ?? 'unknown'})`)
+    log('item.place', { item: item.name, at: fmtPos(target) })
+    return placed
+  }
+
+  /** Nearest empty cell 1-3 blocks away with solid ground, not where anyone stands. */
+  private freeSpot (bot: Bot): { target: Vec3Like, ref: Block } | null {
+    const feet = bot.entity.position.floored()
+    const cells: Vec3Like[] = []
+    for (let dx = -3; dx <= 3; dx++) for (let dz = -3; dz <= 3; dz++) for (const dy of [0, -1, 1]) {
+      if (dx === 0 && dz === 0) continue
+      cells.push(feet.offset(dx, dy, dz))
+    }
+    const me = bot.entity.position
+    cells.sort((a, b) => Math.abs(a.distanceTo(me) - 2) - Math.abs(b.distanceTo(me) - 2) || Math.abs(a.y - feet.y) - Math.abs(b.y - feet.y))
+    for (const target of cells) {
+      const cur = bot.blockAt(target)
+      const below = bot.blockAt(target.offset(0, -1, 0))
+      if (!cur || !below || !isFree(cur) || !isSolid(below)) continue
+      if (overlapsEntity(bot, target)) continue
+      return { target, ref: below }
+    }
+    return null
+  }
+
   respawn (): string {
     const bot = this.body.bot
     if (!bot) throw new ActionError('not connected')
@@ -517,6 +826,66 @@ export class Actions {
     log('mc.respawn_requested')
     return 'respawn requested'
   }
+}
+
+type Vec3Like = Bot['entity']['position']
+
+const NEIGHBORS: Array<[number, number, number]> = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]
+
+/** Blocks that open a screen or toggle when clicked: never place against them. */
+const INTERACTIVE = /table|furnace|smoker|chest|barrel|shulker|hopper|dispenser|dropper|door|gate|bed|anvil|lever|button|loom|grindstone|stonecutter|lectern|enchanting|brewing|beacon|bell|note_block|repeater|comparator|crafter|cartography|smithing|fletching|composter/
+
+/** Air, or a plant a placed block replaces (flowers are not replaceable). */
+function isFree (b: Block): boolean {
+  return /^(air|cave_air|void_air|short_grass|tall_grass|fern|large_fern|dead_bush|short_dry_grass|tall_dry_grass|bush)$/.test(b.name)
+}
+
+function isSolid (b: Block): boolean {
+  return b.boundingBox === 'block' && !INTERACTIVE.test(b.name)
+}
+
+/** Would a block at `cell` intersect the bot, a player or a mob? */
+function overlapsEntity (bot: Bot, cell: Vec3Like): boolean {
+  return Object.values(bot.entities).some((e) => {
+    if (e.type === 'object' || e.type === 'orb' || e.name === 'item') return false
+    const half = (e.width || 0.6) / 2
+    const h = e.height || 1.8
+    const p = e.position
+    return p.x + half > cell.x && p.x - half < cell.x + 1 && p.z + half > cell.z && p.z - half < cell.z + 1 && p.y + h > cell.y && p.y < cell.y + 1
+  })
+}
+
+/**
+ * Ask the server for the full inventory state (mineflayer's own no-op click,
+ * `bot._syncWindow`, which craft() only uses for crafting-table windows).
+ */
+async function syncInventory (bot: Bot): Promise<void> {
+  const sync = (bot as unknown as { _syncWindow?: (w: unknown) => Promise<void> })._syncWindow
+  if (!sync) return
+  await withTimeout(sync(bot.inventory), 2_000, 'inventory sync timed out').catch(() => {})
+}
+
+/** Move anything left in the 2x2 crafting grid (slots 1-4) back into the inventory. */
+async function clearCraftingGrid (bot: Bot): Promise<void> {
+  await syncInventory(bot)
+  for (let s = 1; s <= 4; s++) {
+    if (bot.inventory.slots[s]) await withTimeout(bot.putAway(s), 2_000, 'clearing the crafting grid timed out').catch(() => {})
+  }
+  await syncInventory(bot)
+}
+
+function fmtPos (p: { x: number, y: number, z: number }): string {
+  return `${Math.floor(p.x)} ${Math.floor(p.y)} ${Math.floor(p.z)}`
+}
+
+function errText (e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+function sum (m: Map<string, number>): number {
+  let n = 0
+  for (const v of m.values()) n += v
+  return n
 }
 
 function withTimeout<T> (p: Promise<T>, ms: number, message: string): Promise<T> {
