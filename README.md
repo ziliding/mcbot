@@ -38,6 +38,7 @@ Loop prevention: the bot ignores its own game messages (by uuid and by name) and
    Then restart the Hermes gateway, and accept the room invite in Element.
 3. Persona and memory live in Hermes, not in this repo. Set up how luna behaves in the Minecraft room on the Hermes side.
 4. `docker compose up -d --build`, then join `localhost:25565` with a 26.1 client.
+5. The server is private: the port only listens on 127.0.0.1, and a whitelist is enforced. To allow a player, run `scripts/whitelist.sh steve mcbot <other names...>`, listing everyone who should be allowed. It rewrites the whole list with offline-mode uuids. Don't use `/whitelist add` or itzg's `WHITELIST` env var: both store Mojang uuids, which never match on this offline server. Keep the bot's `MC_NAME` in the list.
 
 ## M1 check
 

@@ -11,6 +11,13 @@ services:
       VERSION: ${MC_VER:-26.1}
       ONLINE_MODE: "FALSE"
       ENFORCE_SECURE_PROFILE: "FALSE"
+      # Private server: only whitelisted players may join. Add players from the
+      # server console (`docker exec uta-mc rcon-cli whitelist add <name>`), NOT
+      # via the WHITELIST env var: that resolves names against Mojang and stores
+      # premium UUIDs, which never match the offline UUIDs players get here.
+      # Offline mode trusts the name, so the port is also bound to 127.0.0.1.
+      ENABLE_WHITELIST: "TRUE"
+      ENFORCE_WHITELIST: "TRUE"
       MEMORY: 2G
       MOTD: uta companion server
     ports:
