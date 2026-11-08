@@ -36,14 +36,23 @@ export class MatrixBridge {
   roomId = ''
   private stopped = false
   /** Messages that may still be edited (streamed replies), keyed by original event id. */
-  private readonly pending = new Map<string, { sender: string, body: string, timer: NodeJS.Timeout }>()
+  private readonly pending = new Map<string, { sender: string, body: string, timer: NodeJS.Timeout, afterCommand: 'first' | 'later' | null }>()
+  /**
+   * A `/command` (e.g. `/new`) was sent in the room: Hermes answers it with a
+   * system reply ("✨ Session reset!", model, provider, tips) that must not be
+   * spoken in game. Until this time, new messages are checked for that.
+   */
+  private commandUntil = 0
+  private commandReplySeen = true
   private warnedEncrypted = false
 
   constructor (
     private readonly cfg: MatrixConfig,
     private readonly onMessage: (msg: MatrixMessage) => void,
     /** Wait this long after the last edit before treating a message as final. */
-    private readonly settleMs = 1500
+    private readonly settleMs = 1500,
+    /** After a `/command`, how long new messages may be its reply. */
+    private readonly commandReplyMs = 30_000
   ) {}
 
   async start (): Promise<void> {
@@ -121,6 +130,13 @@ export class MatrixBridge {
         log('matrix.dropped', { reason: 'redacted', eventId: ev.redacts })
         continue
       }
+      // Slash commands from anyone (Element, or this account) open a short
+      // window for their reply. Game lines arrive as "[MC] …", never as "/…".
+      if (ev.type === 'm.room.message' && !ev.content['m.relates_to'] && /^\/[a-z]/i.test(ev.content.body ?? '')) {
+        this.commandUntil = Date.now() + this.commandReplyMs
+        this.commandReplySeen = false
+        log('matrix.command_seen', { sender: ev.sender, command: (ev.content.body ?? '').split(/\s/)[0] })
+      }
       if (ev.type !== 'm.room.message' || ev.sender === this.userId) continue
       if (this.cfg.allowedSenders.length > 0 && !this.cfg.allowedSenders.includes(ev.sender)) continue
       const { msgtype } = ev.content
@@ -140,6 +156,13 @@ export class MatrixBridge {
   private upsert (eventId: string, sender: string, body: string): void {
     const prev = this.pending.get(eventId)
     if (prev) clearTimeout(prev.timer)
+    // Tag a NEW message (not an edit of one that existed before the command)
+    // that starts inside a command window: the first is the command's reply.
+    let afterCommand = prev?.afterCommand ?? null
+    if (!prev && Date.now() < this.commandUntil) {
+      afterCommand = this.commandReplySeen ? 'later' : 'first'
+      this.commandReplySeen = true
+    }
     const timer = setTimeout(() => {
       const p = this.pending.get(eventId)
       this.pending.delete(eventId)
@@ -147,9 +170,13 @@ export class MatrixBridge {
       // Code blocks are never speakable in game chat (tool logs, commands).
       const spoken = p.body.replace(/```[\s\S]*?(?:```|$)/g, '').trim()
       if (!spoken || this.isNoise(spoken)) { log('matrix.dropped', { reason: 'progress', body: p.body.slice(0, 80) }); return }
+      if (p.afterCommand === 'first' || (p.afterCommand === 'later' && isSystemLine(spoken))) {
+        log('matrix.dropped', { reason: 'command_reply', body: p.body.slice(0, 80) })
+        return
+      }
       this.onMessage({ sender: p.sender, body: spoken })
     }, this.settleMs)
-    this.pending.set(eventId, { sender, body, timer })
+    this.pending.set(eventId, { sender, body, timer, afterCommand })
   }
 
   /**
@@ -182,6 +209,11 @@ export class MatrixBridge {
     if (!res.ok) throw new Error(`${method} ${path.split('?')[0]} -> ${res.status} ${text.slice(0, 200)}`)
     return (text ? JSON.parse(text) : {}) as T
   }
+}
+
+/** Hermes system output starts with a symbol or emoji ("✨ …", "◆ …", "⚠️ …"), not a word or a bracket. */
+function isSystemLine (body: string): boolean {
+  return /^(?:\p{Extended_Pictographic}|[\p{So}\p{Sm}•◆✦➕➖])/u.test(body.trimStart())
 }
 
 function errMsg (e: unknown): string {
