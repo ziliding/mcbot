@@ -35,10 +35,11 @@ export function startLegacyQueue (body: Body, dataDir: string, defaultPlayer: st
   let busy = false
   setInterval(() => {
     if (busy || !body.ready) return
-    let buf: string
-    try { buf = fs.readFileSync(cmds, 'utf8') } catch { return }
+    // Offsets are in bytes (they start from fs.stat size); never mix with string length.
+    let buf: Buffer
+    try { buf = fs.readFileSync(cmds) } catch { return }
     if (offset > buf.length) offset = 0
-    const fresh = buf.slice(offset)
+    const fresh = buf.subarray(offset).toString('utf8')
     offset = buf.length
     if (!fresh.trim()) return
     busy = true
