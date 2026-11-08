@@ -20,7 +20,7 @@ Source is in `src/` (strict TypeScript):
 - `actions.ts` holds the bot's verbs: state, come, follow, go_to, mine (with `*` wildcards, e.g. `*_log`), look, equip, eat, give, drop, stop, respawn. A movement verb cancels the one before it. Everything that uses the held item (equip, eat, toss, tool swaps) runs one at a time.
 - `reflexes.ts` is the reflex layer (M3). It runs on every physics tick, makes no LLM or MCP calls, and never chats. Highest priority first:
   1. Escape lava, fire and deep water (when its air drops).
-  2. Fight hostile mobs within 8 blocks, and anything that hits it. It equips its best sword or axe and only hits at full attack strength. It leaves endermen and piglins alone unless they attack, and never fights players.
+  2. Fight hostile mobs within 8 blocks, and anything that hits it. It equips its best sword or axe and only hits at full attack strength. It never attacks creepers or wardens. It leaves endermen and piglins alone unless they attack. It never fights players, golems or villagers, and never blames unattributed damage (falls, starving) on a bystander.
   3. Eat the best safe food when food ≤ 14, or when health ≤ 14 and food < 20.
   4. Wear the best armor it carries.
 

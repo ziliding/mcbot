@@ -69,7 +69,13 @@ export class Actions {
       moves.allowParkour = true
       moves.allowSprinting = true
       bot.pathfinder.setMovements(moves)
+      // New bot after a reconnect: whatever held the slot (even a reflex) is gone.
       this.activity = 'idle'
+      this.slotReflex = null
+      this.sideReflex = null
+      this.following = null
+      this.resumeFollow = null
+      this.generation++
     })
   }
 
@@ -307,7 +313,13 @@ export class Actions {
         if (!fresh || !ids.includes(fresh.type)) continue
         if (!bot.canDigBlock(fresh)) throw new ActionError(`can't dig the ${blockName} at ${fresh.position.toString()} from here`)
         await this.withHands('equip tool', () => this.equipBestTool(fresh))
-        await bot.dig(fresh, true)
+        try {
+          await bot.dig(fresh, true)
+        } catch (e) {
+          // begin() aborts the dig when something (e.g. a reflex) takes the slot.
+          if (!this.stillCurrent(gen)) throw this.interrupted()
+          throw e
+        }
         dug++
         await this.collectDrops(gen, fresh.position)
       }
@@ -411,7 +423,7 @@ export class Actions {
         const again = prev && prev.type !== food.type ? bot.inventory.items().find((i) => i.type === prev.type) : undefined
         if (again) await bot.equip(again, 'hand').catch(() => {})
       }
-      await sleep(150) // the food bar update arrives just after the eat confirmation
+      await sleep(400) // the food bar update arrives just after the eat confirmation
       const warn = BAD_FOODS.has(food.name) ? ' (that one is harmful: expect hunger/poison)' : ''
       log('item.eat', { item: food.name, food: bot.food })
       return `ate ${food.name}, food ${before} -> ${bot.food}${warn}`

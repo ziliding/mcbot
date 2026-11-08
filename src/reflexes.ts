@@ -10,8 +10,14 @@ import { log } from './log.js'
 
 const { goals } = pathfinderPkg
 
-/** Hostile-typed mobs that are left alone unless they attack first. */
-const NEUTRAL = new Set(['enderman', 'zombified_piglin', 'piglin', 'creaking'])
+/**
+ * Hostile-typed mobs that are never attacked proactively: neutrals that only
+ * fight back, plus creepers (their 1.5 s fuse beats our ~4 hits, and the blast
+ * would land next to the player) and wardens (unwinnable).
+ */
+const NEUTRAL = new Set(['enderman', 'zombified_piglin', 'piglin', 'creaking', 'creeper', 'warden'])
+/** Never fought, even when they hit us: hopeless or friendly. */
+const NEVER_FIGHT = new Set(['iron_golem', 'snow_golem', 'villager', 'wandering_trader', 'warden'])
 /** Mobs minecraft-data types as "mob"/"animal" that attack on sight anyway. */
 const EXTRA_HOSTILE = new Set(['slime', 'magma_cube', 'hoglin', 'phantom'])
 const ENGAGE_RANGE = 8
@@ -63,7 +69,10 @@ export class Reflexes {
 
   private attach (bot: Bot): void {
     this.bot = bot
+    // A new bot after a reconnect: Actions resets the activity slot itself.
     this.fight = null
+    this.escaping = null
+    this.eating = false
     bot.on('physicsTick', () => {
       try { this.onTick(bot) } catch (e) { log('reflex.error', { message: e instanceof Error ? e.message : String(e) }) }
     })
@@ -170,12 +179,14 @@ export class Reflexes {
 
   private pickTarget (bot: Bot, now: number): { entity: Entity, why: Fight['why'] } | null {
     const me = bot.entity.position
-    // Retaliate against whatever just hurt us (any mob, never a player).
+    // Retaliate against the mob that just hurt us. Damage with no attacker
+    // (fall, starvation, fire, drowning) is never blamed on whoever stands
+    // nearby: that could be the player's pet.
     const hurt = this.lastHurt
     if (hurt && now - hurt.at < 1500) {
       this.lastHurt = null
-      const src = hurt.source ?? nearest(bot, (e) => isMob(e), 4)
-      if (src && src.type !== 'player' && isMob(src) && bot.entities[src.id] && src.position.distanceTo(me) <= 16) {
+      const src = hurt.source
+      if (src && isMob(src) && !NEVER_FIGHT.has(src.name ?? '') && bot.entities[src.id] && src.position.distanceTo(me) <= 16) {
         return { entity: src, why: 'attacked' }
       }
     }
