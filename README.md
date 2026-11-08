@@ -24,14 +24,18 @@ Loop prevention: the bot ignores its own game messages (by uuid and by name) and
 ## Setup
 
 1. Add the keys from `.env.example` to your `.env`. On a fresh checkout, copy it instead. Set `MC_EULA=TRUE` only after reading the EULA.
-2. Matrix account for the bot (one time): register `@luna:example.com` with the registration token (for example in Element at http://127.0.0.1:18080). Then get a token for a dedicated device:
-   ```bash
-   curl -s -XPOST http://127.0.0.1:6167/_matrix/client/v3/login -H 'content-type: application/json' -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"luna"},"password":"<password>","initial_device_display_name":"uta-mcbot"}'
-   ```
-   Put `access_token` into `MATRIX_ACCESS_TOKEN`.
-3. Create an **unencrypted** room. The bridge can't read E2EE rooms. Invite the bot and Hermes, and set `MATRIX_ROOM` and `MATRIX_ALLOWED_SENDERS` (Hermes's Matrix id).
-4. Hermes side: add `@luna:example.com` to Hermes's allowed users for Matrix, or Hermes will ignore the bot's messages. Set up the room's persona there as well; persona and memory live in Hermes, not in this repo.
-5. `docker compose up -d --build`, then join `localhost:25565` with a 26.1 client.
+2. Matrix (one time): run `scripts/matrix-setup.sh` from the repo root. It:
+   - registers the bot's **own** account, `@uta-mc:example.com`. `@luna` is Hermes's account (the `luna` profile), so the bot can't use it.
+   - creates an **unencrypted** room (the bridge can't read E2EE) and invites Hermes (`@luna`) and, optionally, you.
+   - writes `MATRIX_ACCESS_TOKEN`, `MATRIX_ROOM` and `MATRIX_ALLOWED_SENDERS=@luna:example.com` into `.env`.
+   - optionally updates `~/.hermes/profiles/luna/.env` (after a backup):
+     - adds the bot to `MATRIX_ALLOWED_USERS`.
+     - if the room has 3 members, adds it to `MATRIX_FREE_RESPONSE_ROOMS`. Hermes otherwise only replies to @-mentions in group rooms, and a 2-member room counts as a DM.
+     - optionally sets `MATRIX_SESSION_SCOPE=room`, so the room is one continuous session rather than a thread per message. This applies to all of luna's group rooms.
+
+   Then restart the Hermes gateway, and accept the room invite in Element.
+3. Persona and memory live in Hermes, not in this repo. Set up how luna behaves in the Minecraft room on the Hermes side.
+4. `docker compose up -d --build`, then join `localhost:25565` with a 26.1 client.
 
 ## M1 check
 
