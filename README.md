@@ -81,7 +81,7 @@ Watch it with `docker compose logs -f mcbot | grep -E 'cerebellum|plan|triage|je
 
 Jev bills input tokens only, $0.042 per million (`jev-1.14.0`, Nov 2026). Measured here: a cerebellum request is ~800 tokens and 100–330 ms (p50 ~150 ms); a triage request is ~520 tokens and ~130 ms.
 - Ceiling, a call every tick at 1 Hz: ~2.9 M tokens/h ≈ **$0.12/hour**.
-- Actual, with change detection: ~7 calls in 45 s of plan work (≈ $0.02/hour), and **zero** while idle with no plan.
+- Actual, with change detection: ~7 calls in 45 s of plan work (≈ $0.02/hour), and **zero** while idle with no plan. Exception: idle but slightly hungry (food 15–16, below the reflex's eat threshold) or next to a creeper that doesn't move re-asks every `CEREBELLUM_MAX_STALE_MS` (10 s), about 360 calls ≈ $0.01/hour.
 
 Each answer logs `jev.answer` (ms, model, tokens, usd, probabilities); `jev.usage` every `JEV_USAGE_LOG_MS` (5 min) logs the rolling last-hour requests/tokens/USD by purpose, totals, errors and skipped calls.
 

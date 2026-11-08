@@ -60,13 +60,18 @@ async function runLocal (player: string, command: LocalCommand): Promise<string>
     case 'follow': return actions.follow(player, 3)
     case 'stop':
     case 'wait': return actions.stop()
-    case 'come':
-      // Ack first; the walk can take a while. Failures are reported in chat.
-      void actions.comeTo(player, 2).catch((e: unknown) => {
+    case 'come': {
+      // Fail before acknowledging when it obviously can't work (busy, out of
+      // sight): the caller then forwards the line to Hermes.
+      if (actions.slotReflex) throw new Error(`busy: ${actions.slotReflex}`)
+      if (!body.bot?.players[player]?.entity) throw new Error(`${player} is out of sight`)
+      // The walk itself can take a while: ack now, report a late failure in chat.
+      actions.comeTo(player, 2).catch((e: unknown) => {
         log('triage.local_failed', { player, command, error: String(e) })
         body.say(`can't reach you: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200))
       })
       return 'coming'
+    }
   }
 }
 

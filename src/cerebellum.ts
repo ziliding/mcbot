@@ -131,7 +131,9 @@ export class Cerebellum {
 
   start (): void {
     if (this.timer) return
-    this.timer = setInterval(() => { void this.tick() }, this.cfg.tickMs)
+    this.timer = setInterval(() => {
+      this.tick().catch((e: unknown) => { this.inFlight = false; log('cerebellum.error', { message: errText(e) }) })
+    }, this.cfg.tickMs)
     log('cerebellum.start', { ...this.cfg })
   }
 

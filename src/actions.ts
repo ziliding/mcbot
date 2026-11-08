@@ -253,6 +253,7 @@ export class Actions {
   stop (): string {
     if (this.slotReflex) {
       this.resumeFollow = null
+      for (const fn of this.stopListeners) fn()
       return `${this.slotReflex} (automatic reflex, can't be stopped); will stay put afterwards instead of resuming`
     }
     this.begin('idle')
