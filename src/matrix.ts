@@ -5,6 +5,7 @@ import { sleep } from './body.js'
 
 interface RoomEvent {
   type: string
+  redacts?: string
   event_id: string
   sender: string
   content: {
@@ -113,6 +114,13 @@ export class MatrixBridge {
         this.warnedEncrypted = true
         log('matrix.encrypted_room', { hint: 'this bridge cannot read E2EE rooms; use an unencrypted room' })
       }
+      // Hermes deletes its transient progress bubbles; drop them if not yet spoken.
+      if (ev.type === 'm.room.redaction' && ev.redacts && this.pending.has(ev.redacts)) {
+        clearTimeout(this.pending.get(ev.redacts)?.timer)
+        this.pending.delete(ev.redacts)
+        log('matrix.dropped', { reason: 'redacted', eventId: ev.redacts })
+        continue
+      }
       if (ev.type !== 'm.room.message' || ev.sender === this.userId) continue
       if (this.cfg.allowedSenders.length > 0 && !this.cfg.allowedSenders.includes(ev.sender)) continue
       const { msgtype } = ev.content
@@ -135,9 +143,24 @@ export class MatrixBridge {
     const timer = setTimeout(() => {
       const p = this.pending.get(eventId)
       this.pending.delete(eventId)
-      if (p) this.onMessage({ sender: p.sender, body: p.body })
+      if (!p) return
+      if (this.isNoise(p.body)) { log('matrix.dropped', { reason: 'progress', body: p.body.slice(0, 80) }); return }
+      this.onMessage({ sender: p.sender, body: p.body })
     }, this.settleMs)
     this.pending.set(eventId, { sender, body, timer })
+  }
+
+  /**
+   * Hermes tool-progress bubbles ("📚 Reading skill x", "💻 Running code (×2)"):
+   * every line is emoji + label, with no sentence punctuation. Replies, even
+   * ones starting with an emoji, have punctuation somewhere.
+   */
+  private isNoise (body: string): boolean {
+    if (this.cfg.ignorePattern) return this.cfg.ignorePattern.test(body)
+    const lines = body.split('\n').map((l) => l.trim()).filter(Boolean)
+    return lines.length > 0 &&
+      lines.every((l) => /^(?:┊\s*)?\p{Extended_Pictographic}️?\s+\S/u.test(l)) &&
+      !/[。！？，、…!?]|[.,](?:\s|$)/u.test(body)
   }
 
   private async api<T = unknown> (method: string, path: string, body?: unknown, timeoutMs = 20_000): Promise<T> {

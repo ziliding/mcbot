@@ -16,14 +16,17 @@ export interface MatrixConfig {
   room: string
   /** Matrix user ids whose messages are spoken in game. Empty = anyone in the room except the bot. */
   allowedSenders: string[]
+  /** Overrides the built-in progress-bubble filter: matching messages are not spoken. */
+  ignorePattern: RegExp | null
 }
 
 export interface Config {
   mc: { host: string, port: number, username: string, version: string }
-  /** Player the legacy queue's come/follow/look commands target by default. */
+  /** Player that come/follow/look target when no name is given. */
   defaultPlayer: string
   matrix: MatrixConfig | null
-  dataDir: string
+  /** MCP over Streamable HTTP; null when MCP_TOKEN is unset (server stays off). */
+  mcp: { port: number, token: string } | null
 }
 
 export function loadConfig (): Config {
@@ -42,9 +45,10 @@ export function loadConfig (): Config {
           homeserver: env('MATRIX_HOMESERVER', 'http://tailscale:6167').replace(/\/+$/, ''),
           accessToken: token,
           room,
-          allowedSenders: list('MATRIX_ALLOWED_SENDERS')
+          allowedSenders: list('MATRIX_ALLOWED_SENDERS'),
+          ignorePattern: process.env.MATRIX_IGNORE_REGEX ? new RegExp(process.env.MATRIX_IGNORE_REGEX, 'u') : null
         }
       : null,
-    dataDir: env('DATA_DIR', new URL('../data', import.meta.url).pathname)
+    mcp: process.env.MCP_TOKEN ? { port: Number(env('MCP_PORT', '3333')), token: process.env.MCP_TOKEN } : null
   }
 }

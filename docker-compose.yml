@@ -44,6 +44,16 @@ services:
       # Matrix homeserver (tuwunel shares the "tailscale" container's network
       # namespace in the matrix compose project).
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://tailscale:6167}
+    ports:
+      # MCP endpoint for Hermes (runs on the host). It can control the bot:
+      # localhost only, and every request needs MCP_TOKEN.
+      - "127.0.0.1:${MCP_PORT:-3333}:3333"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3333/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     depends_on:
       mc:
         condition: service_healthy

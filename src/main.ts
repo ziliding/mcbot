@@ -1,11 +1,13 @@
+import { Actions } from './actions.js'
 import { Body } from './body.js'
 import { loadConfig } from './config.js'
-import { startLegacyQueue } from './legacyQueue.js'
 import { log } from './log.js'
 import { MatrixBridge } from './matrix.js'
+import { startMcpServer } from './mcp.js'
 
 const cfg = loadConfig()
 const body = new Body(cfg.mc)
+const actions = new Actions(body, cfg.defaultPlayer)
 
 let matrix: MatrixBridge | null = null
 if (cfg.matrix) {
@@ -25,13 +27,16 @@ body.on('playerChat', ({ player, text }) => {
   void matrix?.send(`[MC] ${player}: ${text}`)
 })
 
-startLegacyQueue(body, cfg.dataDir, cfg.defaultPlayer)
+// MCP tools for Hermes: same process, same bot.
+const mcp = cfg.mcp ? startMcpServer(actions, cfg.mcp.port, cfg.mcp.token) : null
+if (!cfg.mcp) log('mcp.disabled', { reason: 'MCP_TOKEN not set' })
 body.start()
 
 for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     log('shutdown', { sig })
     matrix?.stop()
+    mcp?.close()
     body.stop()
     setTimeout(() => process.exit(0), 500)
   })
