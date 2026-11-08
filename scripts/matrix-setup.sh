@@ -23,7 +23,7 @@ HERMES_ENV="${HERMES_ENV:-$HOME/.hermes/profiles/$PERSONA/.env}"
 HERMES_ID="${HERMES_ID:-$(grep -E '^MATRIX_USER_ID=' "$HERMES_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)}"
 HERMES_ID="${HERMES_ID:-@$PERSONA:$SERVER_NAME}"
 HUMAN_ID="${HUMAN_ID:-@you:$SERVER_NAME}"
-MATRIX_COMPOSE="${MATRIX_COMPOSE:-$HOME/projects/apps/matrix/docker-compose.yml}"
+TUWUNEL_CONTAINER="${TUWUNEL_CONTAINER:-matrix-tuwunel-1}"
 BOT_ENV="${BOT_ENV:-.env}"
 
 die () { echo "error: $*" >&2; exit 1; }
@@ -71,14 +71,16 @@ AVAIL=$(api GET "/register/available?username=$LOCALPART" | jq -r '.available //
 if [[ "$AVAIL" == "true" ]]; then
   read -r -s -p "Re-enter password: " PASS2; echo
   [[ "$PASS" == "$PASS2" ]] || die "passwords differ"
-  REG_TOKEN=$(sed -nE 's/^[[:space:]]*TUWUNEL_REGISTRATION_TOKEN:[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/p' "$MATRIX_COMPOSE" 2>/dev/null | head -1)
+  # Read the token the running homeserver actually uses (compose only holds a ${...} placeholder).
+  REG_TOKEN=$(docker inspect "$TUWUNEL_CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -nE 's/^TUWUNEL_REGISTRATION_TOKEN=//p' | head -1 || true)
+  [[ "$REG_TOKEN" == \$* ]] && REG_TOKEN=""
   if [[ -z "$REG_TOKEN" ]]; then read -r -s -p "Registration token: " REG_TOKEN; echo; fi
   BODY=$(jq -nc --arg u "$LOCALPART" --arg p "$PASS" '{username:$u,password:$p,initial_device_display_name:"uta-mcbot"}')
   SESSION=$(api POST /register "$BODY" | jq -r '.session // empty')
   [[ -n "$SESSION" ]] || die "registration did not start a UIA session"
   BODY=$(jq -c --arg t "$REG_TOKEN" --arg s "$SESSION" '. + {auth:{type:"m.login.registration_token",token:$t,session:$s}}' <<<"$BODY")
   RES=$(api POST /register "$BODY")
-  echo "  registered $BOT_ID"
+  if [[ -n "$(jq -r '.access_token // empty' <<<"$RES")" ]]; then echo "  registered $BOT_ID"; fi
 else
   echo "  $BOT_ID exists; logging in"
   BODY=$(jq -nc --arg u "$LOCALPART" --arg p "$PASS" '{type:"m.login.password",identifier:{type:"m.id.user",user:$u},password:$p,initial_device_display_name:"uta-mcbot"}')
