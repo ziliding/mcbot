@@ -144,8 +144,10 @@ export class MatrixBridge {
       const p = this.pending.get(eventId)
       this.pending.delete(eventId)
       if (!p) return
-      if (this.isNoise(p.body)) { log('matrix.dropped', { reason: 'progress', body: p.body.slice(0, 80) }); return }
-      this.onMessage({ sender: p.sender, body: p.body })
+      // Code blocks are never speakable in game chat (tool logs, commands).
+      const spoken = p.body.replace(/```[\s\S]*?(?:```|$)/g, '').trim()
+      if (!spoken || this.isNoise(spoken)) { log('matrix.dropped', { reason: 'progress', body: p.body.slice(0, 80) }); return }
+      this.onMessage({ sender: p.sender, body: spoken })
     }, this.settleMs)
     this.pending.set(eventId, { sender, body, timer })
   }
@@ -157,10 +159,12 @@ export class MatrixBridge {
    */
   private isNoise (body: string): boolean {
     if (this.cfg.ignorePattern) return this.cfg.ignorePattern.test(body)
-    const lines = body.split('\n').map((l) => l.trim()).filter(Boolean)
+    // Truncated previews end in "..." / "…"; that is not sentence punctuation.
+    const text = body.replace(/(?:\.\.\.|…)(?=\s|$)/gu, '')
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean)
     return lines.length > 0 &&
-      lines.every((l) => /^(?:┊\s*)?\p{Extended_Pictographic}️?\s+\S/u.test(l)) &&
-      !/[。！？，、…!?]|[.,](?:\s|$)/u.test(body)
+      lines.every((l) => /^(?:┊\s*)?\p{Extended_Pictographic}\uFE0F?\s+\S/u.test(l)) &&
+      !/[。！？，、!?]|[.,](?:\s|$)/u.test(text)
   }
 
   private async api<T = unknown> (method: string, path: string, body?: unknown, timeoutMs = 20_000): Promise<T> {

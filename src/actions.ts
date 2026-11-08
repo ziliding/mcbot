@@ -53,7 +53,8 @@ export class Actions {
   /** Cancel the running activity and claim the slot for a new one. */
   private begin (activity: string): number {
     const bot = this.bot()
-    bot.pathfinder.stop()
+    // setGoal(null) cancels immediately. Never use pathfinder.stop() here: it only
+    // sets a flag that lingers and kills the *next* goto ("Path was stopped").
     bot.pathfinder.setGoal(null)
     if (bot.targetDigBlock) bot.stopDigging()
     this.activity = activity
@@ -95,7 +96,7 @@ export class Actions {
       await Promise.race([
         bot.pathfinder.goto(goal),
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => { bot.pathfinder.stop(); reject(new ActionError(`gave up after ${timeoutMs / 1000}s`)) }, timeoutMs)
+          timer = setTimeout(() => { reject(new ActionError(`gave up after ${timeoutMs / 1000}s`)); bot.pathfinder.setGoal(null) }, timeoutMs)
         })
       ])
     } catch (e) {
@@ -154,9 +155,17 @@ export class Actions {
     const target = this.player(playerName)
     const gen = this.begin(`coming to ${target.username ?? 'player'}`)
     try {
-      const p = target.position
-      await this.goto(gen, new goals.GoalNear(p.x, p.y, p.z, range), 60_000)
-      return `arrived, ${round(this.bot().entity.position.distanceTo(target.position))} blocks from ${target.username}`
+      // The player may keep moving: re-aim at their current position until close.
+      const deadline = Date.now() + 60_000
+      const dist = (): number => this.bot().entity.position.distanceTo(target.position)
+      while (dist() > range + 1) {
+        const left = deadline - Date.now()
+        if (left <= 0) throw new ActionError(`still ${round(dist())} blocks from ${target.username} after 60s; they may be moving away. Try follow_player`)
+        const p = target.position
+        await this.goto(gen, new goals.GoalNear(p.x, p.y, p.z, range), Math.min(left, 30_000))
+        if (!this.bot().players[target.username ?? '']?.entity) throw new ActionError(`lost sight of ${target.username}`)
+      }
+      return `arrived, ${round(dist())} blocks from ${target.username}`
     } finally { this.finish(gen) }
   }
 
@@ -205,6 +214,7 @@ export class Actions {
         const fresh = bot.blockAt(block.position)
         if (!fresh || !ids.includes(fresh.type)) continue
         if (!bot.canDigBlock(fresh)) throw new ActionError(`can't dig the ${blockName} at ${fresh.position.toString()} from here`)
+        await this.equipBestTool(fresh)
         await bot.dig(fresh, true)
         dug++
         await this.collectDrops(gen, fresh.position)
@@ -214,6 +224,20 @@ export class Actions {
     const summary = `dug ${dug}/${count} ${blockName}, inventory +${gained} (now ${have()})`
     if (dug < count) throw new ActionError(`${summary}; no more ${blockName} within ${maxDistance} blocks`)
     return summary
+  }
+
+  /** Hold whichever inventory item digs this block fastest (e.g. an axe for logs). */
+  private async equipBestTool (block: NonNullable<ReturnType<Bot['blockAt']>>): Promise<void> {
+    const bot = this.bot()
+    const effects = bot.entity.effects
+    const time = (type: number | null): number => block.digTime(type, false, false, false, [], effects)
+    let best = bot.heldItem
+    let bestTime = time(best?.type ?? null)
+    for (const item of bot.inventory.items()) {
+      const t = time(item.type)
+      if (t < bestTime) { best = item; bestTime = t }
+    }
+    if (best && best !== bot.heldItem) await bot.equip(best, 'hand')
   }
 
   /** Walk over item drops near `pos` so they get picked up. */
