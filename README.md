@@ -65,8 +65,8 @@ How Hermes connects:
 The server is stateless, so restarting Hermes or the bot never strands a session. The bot stays in the world while Hermes restarts.
 
 Two things about Hermes sessions:
-- **Tool lists are fixed per session.** A session keeps the tool list it started with. After adding or changing the MCP server, reset the game room's session by sending `/new` as `@mcbot`. The session is keyed to the bot account, so `/new` from your own account resets a different session.
-- **Game chat and your Matrix messages are separate conversations.** The root `~/.hermes/config.yaml` has `group_sessions_per_user: true`. That setting is read only from the root config, not from the persona profile. Setting it to `false` there would merge them, but it also merges sessions in every persona's group rooms.
+- **Tool lists are fixed per session.** A session keeps the tool list it started with. After adding or changing the MCP server, send `/new` in the game room to start a fresh session.
+- **One conversation per room.** For this, set `group_sessions_per_user: false` in the root `~/.hermes/config.yaml` (the root config is the only place it's read), then restart the gateway. Its default, `true`, keeps a separate session per sender. Game chat, relayed by `@mcbot`, and your own messages in Element share one Hermes session. Each line still says who spoke: `[MC] steve: …` or your own name.
 
 ## M1 check
 
