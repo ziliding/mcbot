@@ -23,7 +23,7 @@ Loop prevention: the bot ignores its own game messages (by uuid and by name) and
 
 ## Setup
 
-1. `cp .env.example .env` and fill it in. Set `MC_EULA=TRUE` only after reading the EULA.
+1. Add the keys from `.env.example` to your `.env`. On a fresh checkout, copy it instead. Set `MC_EULA=TRUE` only after reading the EULA.
 2. Matrix account for the bot (one time): register `@luna:example.com` with the registration token (for example in Element at http://127.0.0.1:18080). Then get a token for a dedicated device:
    ```bash
    curl -s -XPOST http://127.0.0.1:6167/_matrix/client/v3/login -H 'content-type: application/json' -d '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"luna"},"password":"<password>","initial_device_display_name":"uta-mcbot"}'
