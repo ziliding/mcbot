@@ -329,7 +329,7 @@ export class Actions {
   async mineBlock (blockName: string, count: number, maxDistance: number): Promise<string> {
     const bot = this.bot()
     // "*_log" = any log: lets "chop a tree" work in any biome.
-    const pattern = new RegExp('^' + blockName.split('*').map(escapeRe).join('[a-z_]*') + '$')
+    const pattern = blockPattern(blockName)
     const ids = Object.values(bot.registry.blocksByName).filter((b) => pattern.test(b.name)).map((b) => b.id)
     if (ids.length === 0) throw new ActionError(`unknown block "${blockName}"; use Minecraft ids like oak_log, stone, iron_ore, or a wildcard like *_log`)
     const isTarget = (name: string): boolean => pattern.test(name)
@@ -514,6 +514,11 @@ function withTimeout<T> (p: Promise<T>, ms: number, message: string): Promise<T>
     p,
     new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new ActionError(message)), ms) })
   ]).finally(() => clearTimeout(timer))
+}
+
+/** `*_log` → /^[a-z_]*_log$/: the wildcard syntax mine_block and gather steps share. */
+export function blockPattern (name: string): RegExp {
+  return new RegExp('^' + name.split('*').map(escapeRe).join('[a-z_]*') + '$')
 }
 
 function escapeRe (s: string): string {

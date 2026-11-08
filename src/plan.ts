@@ -1,18 +1,55 @@
+import { z } from 'zod'
+
 /**
  * Plans: an ordered list of typed steps the cerebellum works through. Held in
- * memory only. M5 adds set_plan / get_plan / clear_plan MCP tools on top of
- * `PlanStore`; nothing here knows about MCP or Matrix.
+ * memory only. The MCP tools set_plan / get_plan / clear_plan (mcp.ts) sit on
+ * top of `PlanStore`; nothing here knows about MCP or Matrix.
+ *
+ * The zod schemas below are the single source of truth for a step's shape:
+ * the MCP tool schema, `!plan {json}` and CEREBELLUM_PLAN all parse with them,
+ * and `PlanStep` is inferred from them, so executors and Jev options stay in
+ * step with what Hermes can send.
  */
 
-export type PlanStep =
-  /** Mine `count` more blocks matching `block` (Minecraft id, `*` wildcard allowed: `*_log`). */
-  | { kind: 'gather', block: string, count: number }
-  /** Walk to coordinates (y optional). */
-  | { kind: 'move_to', x: number, y?: number, z: number }
-  /** Walk back to a player (default: the companion player). */
-  | { kind: 'come_to_player', player?: string }
-  /** Stay put for a while. */
-  | { kind: 'wait', seconds: number }
+export const STEP_KINDS = ['gather', 'move_to', 'come_to_player', 'wait'] as const
+
+const coord = (axis: string): z.ZodNumber => z.number({ error: `${axis} must be a number (block coordinate)` }).finite()
+
+export const GatherStepSchema = z.strictObject({
+  kind: z.literal('gather'),
+  block: z.string({ error: 'gather needs `block`: a Minecraft block id such as oak_log, or a wildcard like *_log' }).min(1)
+    .describe('Minecraft BLOCK id to mine, e.g. oak_log, stone, coal_ore, sand. `*` is a wildcard: *_log = any log. Name the block, not its drop (coal_ore, not coal; stone drops cobblestone).'),
+  count: z.number({ error: 'gather needs `count`: how many blocks to mine (1-256)' }).int().min(1).max(256)
+    .describe('How many MORE blocks to mine (counted from what is already carried).')
+}).describe('Mine blocks nearby (searches about 48 blocks around the body) and pick up the drops.')
+
+export const MoveToStepSchema = z.strictObject({
+  kind: z.literal('move_to'),
+  x: coord('x'),
+  y: coord('y').optional().describe('Omit to only reach the x/z column.'),
+  z: coord('z')
+}).describe('Walk to coordinates.')
+
+export const ComeToPlayerStepSchema = z.strictObject({
+  kind: z.literal('come_to_player'),
+  player: z.string().min(1).optional().describe('Player name; omit for the usual companion player.')
+}).describe('Walk back to a player and stop next to them.')
+
+export const WaitStepSchema = z.strictObject({
+  kind: z.literal('wait'),
+  seconds: z.number({ error: 'wait needs `seconds` (1-600)' }).min(1).max(600)
+}).describe('Stay where you are for a while.')
+
+export const PlanStepSchema = z.discriminatedUnion('kind', [GatherStepSchema, MoveToStepSchema, ComeToPlayerStepSchema, WaitStepSchema], {
+  error: (iss) => iss.code === 'invalid_union' ? `unknown step kind; \`kind\` must be one of ${STEP_KINDS.join(', ')}` : undefined
+})
+
+export const PlanSchema = z.object({
+  goal: z.string().max(200).optional(),
+  steps: z.array(PlanStepSchema).min(1, 'a plan needs at least one step').max(20, 'at most 20 steps')
+})
+
+export type PlanStep = z.infer<typeof PlanStepSchema>
 
 export type PlanStatus = 'active' | 'paused' | 'done' | 'failed'
 
@@ -56,30 +93,42 @@ export function parsePlan (spec: string): Plan {
 }
 
 export function validatePlan (raw: unknown): Plan {
-  const o = raw as { goal?: unknown, steps?: unknown }
-  if (!o || typeof o !== 'object' || !Array.isArray(o.steps) || o.steps.length === 0) throw new Error('plan needs a non-empty steps array')
-  const steps = o.steps.map((s: unknown, i: number): PlanStep => {
-    const st = s as Record<string, unknown>
-    const num = (k: string): number => {
-      const v = st[k]
-      if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`step ${i}: ${k} must be a number`)
-      return v
-    }
-    switch (st.kind) {
-      case 'gather':
-        if (typeof st.block !== 'string' || !st.block) throw new Error(`step ${i}: gather needs block`)
-        return { kind: 'gather', block: st.block, count: Math.max(1, Math.floor(num('count'))) }
-      case 'move_to':
-        return st.y === undefined ? { kind: 'move_to', x: num('x'), z: num('z') } : { kind: 'move_to', x: num('x'), y: num('y'), z: num('z') }
-      case 'come_to_player':
-        return typeof st.player === 'string' ? { kind: 'come_to_player', player: st.player } : { kind: 'come_to_player' }
-      case 'wait':
-        return { kind: 'wait', seconds: num('seconds') }
-      default:
-        throw new Error(`step ${i}: unknown kind ${String(st.kind)}`)
-    }
+  const r = PlanSchema.safeParse(raw)
+  if (!r.success) throw new Error(formatIssues(r.error))
+  return { goal: r.data.goal?.trim() || 'unnamed plan', steps: r.data.steps }
+}
+
+/** zod issues as short readable lines: "steps.0.kind: unknown step kind; ...". */
+export function formatIssues (e: z.ZodError): string {
+  return e.issues.map((i) => (i.path.length ? `${i.path.join('.')}: ` : '') + i.message).join('; ')
+}
+
+/** Common drop/material names → the block that yields them (gather mines blocks). */
+const DROP_TO_BLOCK: Record<string, string> = {
+  wood: '*_log', log: '*_log', logs: '*_log', tree: '*_log', coal: 'coal_ore', raw_iron: 'iron_ore', iron: 'iron_ore',
+  raw_gold: 'gold_ore', gold: 'gold_ore', raw_copper: 'copper_ore', copper: 'copper_ore', diamond: 'diamond_ore',
+  emerald: 'emerald_ore', redstone: 'redstone_ore', lapis_lazuli: 'lapis_ore', lapis: 'lapis_ore', flint: 'gravel',
+  clay_ball: 'clay', quartz: 'nether_quartz_ore', rock: 'stone', cobble: 'stone', seeds: 'short_grass'
+}
+
+/**
+ * Checks every gather step's `block` against the block registry (with `*`
+ * wildcards). Returns readable errors with suggestions, or [] when all match.
+ */
+export function checkGatherBlocks (steps: PlanStep[], blockNames: string[], pattern: (name: string) => RegExp): string[] {
+  const errors: string[] = []
+  steps.forEach((s, i) => {
+    if (s.kind !== 'gather') return
+    const re = pattern(s.block)
+    if (blockNames.some((n) => re.test(n))) return
+    const key = s.block.replace(/^minecraft:/, '').toLowerCase()
+    const mapped = DROP_TO_BLOCK[key]
+    const token = key.replace(/\*/g, '').replace(/^raw_|^_+|_+$/g, '')
+    const similar = token.length >= 3 ? blockNames.filter((n) => n.includes(token)).sort((a, b) => a.length - b.length).slice(0, 5) : []
+    const hints = [...new Set([...(mapped ? [mapped] : []), ...similar])].slice(0, 5)
+    errors.push(`steps.${i}.block: "${s.block}" is not a Minecraft block id` + (hints.length ? `; did you mean ${hints.join(', ')}?` : '; use block ids like oak_log, stone, coal_ore, or a wildcard like *_log') + (mapped ? ' (gather mines the block, not the item it drops)' : ''))
   })
-  return { goal: typeof o.goal === 'string' && o.goal ? o.goal : 'unnamed plan', steps }
+  return errors
 }
 
 export function describeStep (s: PlanStep): string {

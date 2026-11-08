@@ -13,6 +13,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@typesafe-ai/sdk": "^0.7.0",
+    "minecraft-data": "^3.119.0",
     "mineflayer": "4.39.0",
     "mineflayer-pathfinder": "^2.4.5",
     "zod": "^4.6.7"

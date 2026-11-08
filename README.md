@@ -1,7 +1,7 @@
 # uta-mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
-The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) are done.** M5 (plan tools for Hermes, `[EVENT]` escalations into the room) is next.
+The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done.** M6 (ops/observability: traces, reconnect hardening) is next.
 
 ## Layout
 
@@ -27,7 +27,8 @@ Source is in `src/` (strict TypeScript):
   Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, movement tools answer `busy: …`, and an interrupted `go_to` or `mine_block` fails with `interrupted by fighting zombie`. An interrupted follow resumes by itself.
 - `cerebellum.ts` is the cerebellum (M4), see below. `jev.ts` wraps the TypeSafe SDK (timeouts, logging, cost), `plan.ts` holds the typed plan model, `worldstate.ts` builds the compact state Jev reads, and `triage.ts` decides which chat lines the body answers itself.
 - `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank.
-- `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools. It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
+- `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools, plus the plan tools (M5). It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
+- `events.ts` posts `[EVENT] …` escalations to the room (coalesced, rate-limited); `lookout.ts` spots rare ores for "notable find" events.
 
 Every tool call is logged as an `mcp.call` event, with its arguments, duration and result. Reflexes log `reflex.fight`, `reflex.eat`, `reflex.escape`, `reflex.armor` and `reflex.resume`.
 
@@ -57,7 +58,7 @@ Policy (all in code, thresholds via env):
 - Calls are skipped when nothing changed (bucketed fingerprint; re-asked every `CEREBELLUM_MAX_STALE_MS` while something runs), when idle with no plan, and while a reflex or an outside command has nothing to interject. Skips are counted in `jev.usage`.
 - Any explicit stop (chat or the MCP `stop` tool) pauses the plan.
 
-Plans are typed (`plan.ts`): `gather {block, count}`, `move_to {x, y?, z}`, `come_to_player {player?}`, `wait {seconds}`, held in memory with a step index. M5 adds `set_plan`/`get_plan`/`clear_plan` on top of `PlanStore`.
+Plans are typed (`plan.ts`): `gather {block, count}`, `move_to {x, y?, z}`, `come_to_player {player?}`, `wait {seconds}`, held in memory with a step index. The zod schemas in `plan.ts` are the single source of truth: the MCP tool schema, `!plan {json}` and `CEREBELLUM_PLAN` all parse with them. Hermes writes plans (M5, below); code owns the step index.
 
 ### Chat triage
 
@@ -106,6 +107,62 @@ Each answer logs `jev.answer` (ms, model, tokens, usd, probabilities); `jev.usag
 | `TRIAGE_ENABLED` | `true` | Set `false` to forward all chat to Hermes. |
 | `TRIAGE_TIMEOUT_MS` | `1000` | Jev timeout before the grammar-only fallback. |
 | `TRIAGE_ADDRESSED_P` / `TRIAGE_COMMAND_P` | `0.6` / `0.9` | Triage thresholds. |
+
+## Brain → cerebellum (M5)
+
+### Plan tools
+
+- `set_plan {goal, steps[]}`: replaces any plan, takes over from a running follow/go_to (never from a reflex), returns the plan summary. Refused when the cerebellum is off (no `JEV_API`).
+  - Steps are validated against the zod union. Unknown kinds or fields give a readable error (`unknown step kind; \`kind\` must be one of gather, move_to, come_to_player, wait at steps[0].kind`).
+  - Gather blocks are checked against the 26.1 block registry (minecraft-data, so it works while the bot is offline), with suggestions: `"coal" is not a Minecraft block id; did you mean coal_ore, coal_block, deepslate_coal_ore? (gather mines the block, not the item it drops)`.
+- `get_plan`: goal, status, `step: "1/2"`, current step, code-measured progress (`gathered 3 of 5, 2 more needed`), pause reason, all steps. `get_state` includes the same object as `plan`.
+- `clear_plan`: drops the plan and cancels its running work.
+
+**Who advances the step:** code. Completion is measured (inventory delta since the step started, distance, elapsed time). Jev's `step_done` answer is only a logged second opinion (`cerebellum.done_disagree`), as in M4. A new or cleared plan cancels the old plan's running executor, even when the new step maps to the same behavior, and resets the escalation dedupe so a re-sent plan's failure is reported again.
+
+### `[EVENT]` escalations
+
+Hermes is never polled; it wakes on room messages. So the bot account posts `[EVENT] <kind>: <what happened>` and a `now:` line with compact context: position, hp/food, current activity or reflex, plan status and step, players and distances, nearest hostile, top inventory. Hermes can act without calling `get_state` first.
+
+| Event | Source |
+|---|---|
+| `plan complete` | last step measured done |
+| `step stuck` | "no more X within 48 blocks", unknown block, player not online, or Jev judged the step infeasible N ticks in a row; the plan pauses |
+| `step failed` | a step failed twice for another reason; the plan pauses |
+| `unsure` | Jev's top behavior below `CEREBELLUM_LOW_CONF_P` for `CEREBELLUM_LOW_CONF_TICKS` ticks |
+| `died` | the server's death message (cause), death position, whether the plan continues |
+| `notable find` | `EVENT_FIND_BLOCKS` within `EVENT_FIND_RADIUS` with at least one face open to air or water, once per vein |
+
+A player talking to the bot is not an event: triage-forwarded speech stays the normal `[MC] <player>: …` line, never double-posted.
+
+Bursts: events within `EVENT_COALESCE_MS` of the first go out as one `[EVENT] N events:` message; messages are at least `EVENT_MIN_INTERVAL_MS` apart and at most `EVENT_MAX_PER_MIN` per rolling minute. Events held back by either limit are merged into the next message, not dropped (exact duplicates are; past `EVENT_MAX_LINES` the oldest lines are collapsed to "+N earlier"). Every post costs a Hermes turn, so the defaults are quiet. Logs: `event.report` per event, `event.post` per message.
+
+Loop safety is unchanged: the bridge ignores its own Matrix messages, so `[EVENT]` lines never reach game chat; Hermes's replies are spoken in game as usual.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EVENTS_ENABLED` | `true` | `false` = log events only, post nothing. |
+| `EVENT_COALESCE_MS` | `3000` | Merge window after the first event. |
+| `EVENT_MIN_INTERVAL_MS` | `20000` | Minimum gap between two posts. |
+| `EVENT_MAX_PER_MIN` | `3` | Posts per rolling minute. |
+| `EVENT_MAX_LINES` | `6` | Event lines per merged message. |
+| `EVENT_FIND_BLOCKS` | `diamond_ore,deepslate_diamond_ore,emerald_ore,deepslate_emerald_ore,ancient_debris` | Notable-find blocks; empty = off. |
+| `EVENT_FIND_RADIUS` | `16` | Search radius in blocks. |
+| `EVENT_FIND_EVERY_MS` | `10000` | Scan period. |
+
+After changing the MCP tool set, send `/new` in the room so Hermes's session picks up the new tools.
+
+## M5 check
+
+Done on the server (difficulty easy), with a test client as steve standing still, then restored (position, health and inventory as before):
+- `set_plan` "5 logs for steve" (gather 5 `*_log`, then come_to_player) via curl: the bot mined 5 pale oak logs (step done by code at 5/5), walked to steve, and `[EVENT] plan complete` posted 3 s later. Hermes (fresh session after `/new`) woke, called `give` for the 5 logs and answered in game.
+- `gather deepslate_emerald_ore` → `dug 0/1 … no more … within 48 blocks` → `[EVENT] step stuck`, plan paused. Hermes explained in character that it needs an iron pickaxe and a way down.
+- Burst: two infeasible plans 20 ms apart plus a temporary exposed `diamond_ore` 5 blocks away. The replaced plan emitted nothing, and the stuck event (held back by the min interval) and the diamond find went out as one `[EVENT] 2 events:` message.
+- `kill mcbot` (temporary keep_inventory) → `[EVENT] died: mcbot was killed, at -40 77 38 …`.
+- Validation: unknown kind, unknown key (`item`), non-numeric count, empty steps, and an item name for a block (`coal`) all fail with readable errors.
+- Limiter against a fake clock: a 5-event burst plus a duplicate becomes one message at +3 s; later events wait out the 20 s interval and merge; with no interval, the 3-per-minute cap holds and merges the rest.
+
+To check in game: in the room or game chat, ask Hermes "get me 20 logs". It should call `set_plan` (gather 20 `*_log`, then come_to_player). The bot works on its own, then `[EVENT] plan complete` (or `step stuck` if the trees run out) appears in the room and Hermes answers in game, normally with a `give`.
 
 ## M4 check
 

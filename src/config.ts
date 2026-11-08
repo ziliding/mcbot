@@ -1,5 +1,7 @@
 import type { CerebellumConfig } from './cerebellum.js'
+import type { EventReporterConfig } from './events.js'
 import type { JevConfig } from './jev.js'
+import type { LookoutConfig } from './lookout.js'
 import type { TriageConfig } from './triage.js'
 
 function env (name: string, fallback?: string): string {
@@ -46,6 +48,10 @@ export interface Config {
   jev: JevConfig | null
   cerebellum: (CerebellumConfig & { enabled: boolean, plan: string | null })
   triage: TriageConfig & { enabled: boolean }
+  /** `[EVENT]` escalations into the Matrix room (M5). */
+  events: EventReporterConfig
+  /** Rare-ore "notable find" events. */
+  lookout: LookoutConfig
 }
 
 export function loadConfig (): Config {
@@ -97,6 +103,18 @@ export function loadConfig (): Config {
       timeoutMs: num('TRIAGE_TIMEOUT_MS', 1000),
       addressedP: num('TRIAGE_ADDRESSED_P', 0.6),
       commandP: num('TRIAGE_COMMAND_P', 0.9)
+    },
+    events: {
+      enabled: flag('EVENTS_ENABLED', true),
+      coalesceMs: num('EVENT_COALESCE_MS', 3000),
+      minIntervalMs: num('EVENT_MIN_INTERVAL_MS', 20_000),
+      maxPerMinute: num('EVENT_MAX_PER_MIN', 3),
+      maxLines: num('EVENT_MAX_LINES', 6)
+    },
+    lookout: {
+      blocks: process.env.EVENT_FIND_BLOCKS !== undefined ? list('EVENT_FIND_BLOCKS') : ['diamond_ore', 'deepslate_diamond_ore', 'emerald_ore', 'deepslate_emerald_ore', 'ancient_debris'],
+      radius: num('EVENT_FIND_RADIUS', 16),
+      everyMs: num('EVENT_FIND_EVERY_MS', 10_000)
     }
   }
 }

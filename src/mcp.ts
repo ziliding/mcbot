@@ -3,8 +3,34 @@ import { timingSafeEqual } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { ActionError, type Actions } from './actions.js'
+import { ActionError, blockPattern, type Actions } from './actions.js'
+import type { Cerebellum } from './cerebellum.js'
 import { log } from './log.js'
+import { PlanStepSchema, STEP_KINDS, checkGatherBlocks, describeStep, type PlanStore } from './plan.js'
+
+export interface McpDeps {
+  actions: Actions
+  plans: PlanStore
+  /** Null when Jev is off: plans can't run, so set_plan refuses. */
+  cerebellum: Cerebellum | null
+  /** Every block id of the server version, for validating gather steps while offline too. */
+  blockNames: string[]
+}
+
+/** The plan as Hermes sees it: goal, status, which step, code-measured progress. */
+export function planSummary (d: McpDeps): Record<string, unknown> | null {
+  const v = d.plans.view()
+  if (!v) return null
+  return {
+    goal: v.goal,
+    status: v.status,
+    step: v.current ? `${v.stepIndex + 1}/${v.steps.length}` : null,
+    current: v.current ? describeStep(v.current) : null,
+    progress: d.cerebellum?.progressText() ?? null,
+    reason: v.reason,
+    steps: v.steps.map((s, i) => `${i + 1}. ${describeStep(s)}${i < v.stepIndex || v.status === 'done' ? ' (done)' : ''}`)
+  }
+}
 
 type ToolResult = { content: Array<{ type: 'text', text: string }>, isError?: boolean }
 
@@ -25,13 +51,57 @@ async function run (tool: string, args: unknown, fn: () => unknown): Promise<Too
 
 const player = z.string().optional().describe('Minecraft player name; omit for the usual companion player')
 
-function buildServer (a: Actions): McpServer {
-  const s = new McpServer({ name: 'minecraft-body', version: '0.4.0' })
+function buildServer (d: McpDeps): McpServer {
+  const a = d.actions
+  const s = new McpServer({ name: 'minecraft-body', version: '0.5.0' })
 
   s.registerTool('get_state', {
-    description: 'Current state of your Minecraft body: position, health/food, oxygen, time of day, current activity and running reflex (e.g. "fighting zombie", "eating bread"), held item, worn armor, inventory, nearby players and the nearest hostile mob.',
+    description: 'Current state of your Minecraft body: position, health/food, oxygen, time of day, current activity and running reflex (e.g. "fighting zombie", "eating bread"), held item, worn armor, inventory, nearby players, the nearest hostile mob, and the current plan (goal, status, step, measured progress).',
     inputSchema: {}
-  }, async () => run('get_state', {}, () => a.state()))
+  }, async () => run('get_state', {}, () => ({ ...a.state(), plan: planSummary(d) })))
+
+  s.registerTool('set_plan', {
+    description: [
+      'Give your body a multi-step job that it carries out on its own, step by step, while you stay free to talk. Replaces any current plan and takes over from a running follow/go_to.',
+      `Step kinds (\`kind\`): ${STEP_KINDS.join(', ')}.`,
+      '- gather {block, count}: mine `count` more blocks of a Minecraft BLOCK id and pick up the drops, e.g. {"kind":"gather","block":"*_log","count":10} (any wood). Name the block, not the drop: coal_ore not coal, stone (drops cobblestone).',
+      '- move_to {x, y?, z}: walk to coordinates.',
+      '- come_to_player {player?}: walk back to a player (default: your usual companion).',
+      '- wait {seconds}: stay put.',
+      'Use a plan for long or multi-step jobs ("get me 20 logs" = gather 20 *_log, then come_to_player), so you are not blocked for minutes. Use the single tools (mine_block, come_to_player, follow_player...) for quick one-shot actions.',
+      'Progress and completion are measured by the body itself. When the plan finishes, or a step gets stuck (nothing left nearby, player offline, keeps failing), an [EVENT] message arrives in the room: react then, no need to poll. A stuck step pauses the plan; send a new plan or clear_plan.',
+      'Fights, eating and escaping water/lava still happen by reflex; a step interrupted by them resumes by itself. A "stop" from the player pauses the plan.'
+    ].join('\n'),
+    inputSchema: {
+      goal: z.string().min(1).max(200).describe('What the plan is for, in a few words (e.g. "20 logs for steve"). Shown back in events.'),
+      steps: z.array(PlanStepSchema).min(1, 'a plan needs at least one step').max(20, 'at most 20 steps').describe('Steps, done in order.')
+    }
+  }, async (args) => run('set_plan', args, () => {
+    if (!d.cerebellum) throw new ActionError('plans are off on this body (no cerebellum: JEV_API unset); use the single tools like mine_block instead')
+    const errors = checkGatherBlocks(args.steps, d.blockNames, blockPattern)
+    if (errors.length) throw new ActionError(errors.join('\n'))
+    // Take over from an outside activity (a follow, go_to...), which the
+    // cerebellum would otherwise leave alone. Never pre-empts a reflex, and
+    // cancel() does not count as a "stop" (which would pause the new plan).
+    if (!a.slotReflex && a.activity !== 'idle') a.cancel(a.currentGeneration)
+    d.plans.set({ goal: args.goal, steps: args.steps })
+    return { ok: true, note: a.slotReflex ? `starts after the reflex (${a.slotReflex}) ends` : 'started', plan: planSummary(d) }
+  }))
+
+  s.registerTool('get_plan', {
+    description: 'The current plan: goal, status (active, paused, done), the step being worked on, measured progress (e.g. "gathered 3 of 10, 7 more needed"), why it paused, and all steps. Null when there is no plan.',
+    inputSchema: {}
+  }, async () => run('get_plan', {}, () => planSummary(d) ?? 'no plan'))
+
+  s.registerTool('clear_plan', {
+    description: 'Drop the current plan and stop working on it. The body goes idle (use follow_player afterwards if the player wants company).',
+    inputSchema: {}
+  }, async () => run('clear_plan', {}, () => {
+    const had = d.plans.view()
+    if (!had) return 'no plan to clear'
+    d.plans.clear()
+    return `cleared plan "${had.goal}" (was ${had.status})`
+  }))
 
   s.registerTool('say', {
     description: 'Say something in Minecraft game chat. You do NOT need this to reply to players: your normal replies in the Matrix room are already spoken in game.',
@@ -101,7 +171,8 @@ function buildServer (a: Actions): McpServer {
  * to the same Actions (and so the same single bot). Survives Hermes restarts
  * and bot restarts with no session to lose.
  */
-export function startMcpServer (actions: Actions, port: number, token: string): http.Server {
+export function startMcpServer (deps: McpDeps, port: number, token: string): http.Server {
+  const { actions } = deps
   const expected = Buffer.from(`Bearer ${token}`)
   const authorized = (h: string | undefined): boolean => {
     const got = Buffer.from(h ?? '')
@@ -128,7 +199,7 @@ export function startMcpServer (actions: Actions, port: number, token: string): 
           .end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed (stateless server)' }, id: null }))
         return
       }
-      const mcp = buildServer(actions)
+      const mcp = buildServer(deps)
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
       res.on('close', () => { void transport.close(); void mcp.close() })
       await mcp.connect(transport)

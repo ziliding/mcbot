@@ -1,12 +1,15 @@
 import { Actions } from './actions.js'
 import { Body } from './body.js'
+import minecraftData from 'minecraft-data'
 import { Cerebellum } from './cerebellum.js'
 import { loadConfig } from './config.js'
+import { EventReporter } from './events.js'
 import { Jev } from './jev.js'
 import { log } from './log.js'
+import { Lookout } from './lookout.js'
 import { MatrixBridge } from './matrix.js'
 import { startMcpServer } from './mcp.js'
-import { PRESET_PLANS, PlanStore, parsePlan } from './plan.js'
+import { PRESET_PLANS, PlanStore, describeStep, parsePlan } from './plan.js'
 import { Reflexes } from './reflexes.js'
 import { Triage, type LocalCommand } from './triage.js'
 
@@ -35,10 +38,71 @@ if (!jev) log('jev.disabled', { reason: 'JEV_API not set: no cerebellum, no chat
 const cerebellum = jev && cfg.cerebellum.enabled
   ? new Cerebellum(body, actions, plans, jev, cfg.cerebellum, cfg.mc.username, cfg.defaultPlayer)
   : null
+
+// Escalations (M5): `[EVENT] …` lines from @mcbot wake Hermes, which is never
+// polled. The bridge ignores its own messages, so these never loop back into
+// game chat; Hermes's replies are spoken in game as usual.
+const round = (n: number): number => Math.round(n)
+function eventContext (): string {
+  const st = actions.state()
+  if (!st.connected || !st.position) return 'body not in the world (reconnecting)'
+  const parts = [
+    `pos ${round(st.position.x)} ${round(st.position.y)} ${round(st.position.z)}${st.dimension && !st.dimension.endsWith('overworld') ? ` (${st.dimension})` : ''}`,
+    `hp ${round(st.health ?? 0)}/20 food ${st.food ?? 0}/20`,
+    `doing: ${st.reflex ?? st.activity}`
+  ]
+  const v = plans.view()
+  if (v && v.status !== 'done') parts.push(`plan "${v.goal}" ${v.status}${v.current ? ` at step ${v.stepIndex + 1}/${v.steps.length} (${describeStep(v.current)})` : ''}`)
+  const players = st.players.map((p) => `${p.name} ${p.distance === null ? 'out of sight' : `${round(p.distance)}m`}`)
+  parts.push(players.length ? `players: ${players.join(', ')}` : 'no players online')
+  if (st.nearestHostile) parts.push(`hostile: ${st.nearestHostile.name} ${round(st.nearestHostile.distance)}m`)
+  const inv = Object.entries(st.inventory).sort((a, b) => b[1] - a[1])
+  parts.push(inv.length ? `carrying ${inv.slice(0, 6).map(([k, n]) => `${k} x${n}`).join(', ')}${inv.length > 6 ? ` +${inv.length - 6} more kinds` : ''}` : 'carrying nothing')
+  return parts.join(' | ')
+}
+const events = new EventReporter(cfg.events, async (text) => { await matrix?.send(text) }, eventContext)
+
 cerebellum?.onEvent((e) => {
-  // M5: post `[EVENT] …` to the Matrix room so Hermes wakes up. For now: log only.
-  log('cerebellum.event', { type: e.type, message: e.message })
+  const v = plans.view()
+  const where = v ? ` Plan "${v.goal}" ${v.status} at step ${v.stepIndex + 1}/${v.steps.length}${v.reason && e.type !== 'step_infeasible' && e.type !== 'step_failed' ? ` (${v.reason})` : ''}.` : ''
+  switch (e.type) {
+    case 'plan_done':
+      events.report('plan_done', `finished "${v?.goal ?? e.plan ?? 'plan'}" (${v?.steps.map(describeStep).join(', then ') ?? ''}).`)
+      break
+    case 'step_infeasible':
+    case 'step_failed':
+      events.report(e.type, `${e.message}.${where}`)
+      break
+    case 'low_confidence':
+      events.report('low_confidence', `${e.message} on "${e.step ?? 'no step'}" (${cerebellum.progressText() ?? 'no progress info'}).${where}`)
+      break
+  }
 })
+
+// Death: the server's death message names the cause; it arrives around the
+// death packet, so wait a moment and use the latest one about us.
+body.on('spawn', (bot) => {
+  let lastSelfMsg: { text: string, at: number } | null = null
+  bot.on('messagestr', (message: string, position: string) => {
+    if (position !== 'chat' && message.startsWith(`${bot.username} `)) lastSelfMsg = { text: message, at: Date.now() }
+  })
+  bot.on('death', () => {
+    const p = bot.entity?.position
+    const at = p ? `${round(p.x)} ${round(p.y)} ${round(p.z)}` : 'unknown position'
+    const v = plans.view()
+    setTimeout(() => {
+      const cause = lastSelfMsg && Date.now() - lastSelfMsg.at < 5000 ? lastSelfMsg.text : 'cause unknown'
+      const plan = v && v.status === 'active' ? ` The plan continues after respawn ("${v.goal}", step ${v.stepIndex + 1}/${v.steps.length}).` : ''
+      events.report('died', `${cause}, at ${at}. Whatever it carried and no longer has (see "carrying") lies there for ~5 min. Respawned at spawn.${plan}`)
+    }, 1500)
+  })
+})
+
+// Notable finds: rare ores with an open face near the body.
+const lookout = new Lookout(body, cfg.lookout, (f) => {
+  events.report('notable_find', `${f.count > 1 ? `${f.count}× ` : ''}${f.block} nearby at ${f.at.x} ${f.at.y} ${f.at.z} (${f.distance} blocks away, visible from the open).`)
+})
+if (cfg.matrix && cfg.events.enabled) lookout.start()
 const triage = jev && cfg.triage.enabled ? new Triage(jev, cfg.triage, cfg.mc.username) : null
 if (cerebellum) {
   let planLoaded = false
@@ -127,7 +191,8 @@ body.on('playerChat', ({ player, text }) => {
 })
 
 // MCP tools for Hermes: same process, same bot.
-const mcp = cfg.mcp ? startMcpServer(actions, cfg.mcp.port, cfg.mcp.token) : null
+const blockNames = Object.keys(minecraftData(cfg.mc.version).blocksByName)
+const mcp = cfg.mcp ? startMcpServer({ actions, plans, cerebellum, blockNames }, cfg.mcp.port, cfg.mcp.token) : null
 if (!cfg.mcp) log('mcp.disabled', { reason: 'MCP_TOKEN not set' })
 body.start()
 
@@ -135,6 +200,7 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
   process.on(sig, () => {
     log('shutdown', { sig })
     cerebellum?.stop()
+    lookout.stop()
     jev?.close()
     matrix?.stop()
     mcp?.close()

@@ -121,10 +121,28 @@ export class Cerebellum {
       log('plan.change', { change, goal: v.goal, status: v.status, step: v.stepIndex, of: v.steps.length, reason: v.reason })
       if (change === 'done') this.emit({ type: 'plan_done', message: `plan finished: ${v.goal}`, plan: v.goal, step: null })
       if (change === 'paused' || change === 'cleared' || change === 'done' || change === 'failed') this.lowTicks = 0
+      if (change === 'set' || change === 'cleared') {
+        // A new or cleared plan: drop the old plan's work, even when the new
+        // step maps to the same behavior (GATHER -> GATHER would otherwise
+        // "continue" mining the old block), and forget old escalations so the
+        // same failure on a re-sent plan is reported again.
+        if (this.owns(this.running) && this.running.gen !== null) this.actions.cancel(this.running.gen)
+        this.running = null
+        this.stepKey = ''
+        this.escalatedAt.clear()
+      }
     })
   }
 
-  /** Hook for escalation events (M5: post `[EVENT] …` to the Matrix room). */
+  /** Code-measured progress of the active (or paused) plan step, e.g. "gathered 3 of 5, 2 more needed". */
+  progressText (): string | null {
+    const v = this.plans.view()
+    if (!v?.current) return null
+    if (v.status === 'active' && this.stepKey === '') return 'not started yet'
+    return this.progress(v.current, this.actions.state().inventory).text
+  }
+
+  /** Hook for escalation events (main.ts posts them to the Matrix room as `[EVENT] …`). */
   onEvent (fn: (e: CerebellumEvent) => void): void {
     this.listeners.push(fn)
   }
