@@ -1,10 +1,14 @@
-FROM node:24-alpine
-
+FROM node:24-alpine AS build
 WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
 
-COPY package.json ./
+FROM node:24-alpine
+WORKDIR /app
+COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
-
-COPY bot.js ./
-
-CMD ["node", "bot.js"]
+COPY --from=build /app/dist ./dist
+CMD ["node", "dist/main.js"]

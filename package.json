@@ -1,14 +1,21 @@
 {
   "name": "uta-mcbot",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Headless Minecraft Java bot bridge (mineflayer) driven by a JSONL command queue",
-  "main": "bot.js",
+  "description": "Minecraft companion bot: mineflayer body, Matrix bridge to Hermes",
+  "type": "module",
+  "main": "dist/main.js",
   "scripts": {
-    "start": "node bot.js"
+    "build": "tsc -p .",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p . --noEmit"
   },
   "dependencies": {
     "mineflayer": "4.39.0",
     "mineflayer-pathfinder": "^2.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^5.9.0"
   }
 }

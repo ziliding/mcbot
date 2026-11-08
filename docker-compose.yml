@@ -1,11 +1,48 @@
 services:
+  mc:
+    image: itzg/minecraft-server:latest
+    container_name: uta-mc
+    restart: unless-stopped
+    environment:
+      # You must accept the Minecraft EULA yourself: set MC_EULA=TRUE in .env
+      # after reading https://aka.ms/MinecraftEULA
+      EULA: ${MC_EULA:-FALSE}
+      TYPE: VANILLA
+      VERSION: ${MC_VER:-26.1}
+      ONLINE_MODE: "FALSE"
+      ENFORCE_SECURE_PROFILE: "FALSE"
+      MEMORY: 2G
+      MOTD: uta companion server
+    ports:
+      # Offline-mode server: never expose beyond this machine.
+      - "127.0.0.1:25565:25565"
+    volumes:
+      - ./mc-data:/data
+    healthcheck:
+      test: ["CMD", "mc-health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 2m
+      retries: 3
+
   mcbot:
     build: .
     container_name: uta-mcbot
     restart: unless-stopped
     env_file: .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    environment:
+      # Inside the compose network the server is reached by service name.
+      MC_HOST: mc
+      MC_PORT: "25565"
+      # Matrix homeserver (tuwunel shares the "tailscale" container's network
+      # namespace in the matrix compose project).
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://tailscale:6167}
+    depends_on:
+      mc:
+        condition: service_healthy
+    networks:
+      - default
+      - matrix
     volumes:
       - ./data:/app/data
     logging:
@@ -13,3 +50,8 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+networks:
+  matrix:
+    name: matrix_default
+    external: true
