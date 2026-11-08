@@ -26,10 +26,10 @@ async function run (tool: string, args: unknown, fn: () => unknown): Promise<Too
 const player = z.string().optional().describe('Minecraft player name; omit for the usual companion player')
 
 function buildServer (a: Actions): McpServer {
-  const s = new McpServer({ name: 'minecraft-body', version: '0.3.0' })
+  const s = new McpServer({ name: 'minecraft-body', version: '0.4.0' })
 
   s.registerTool('get_state', {
-    description: 'Current state of your Minecraft body: position, health/food, time of day, current activity, inventory, nearby players and the nearest hostile mob.',
+    description: 'Current state of your Minecraft body: position, health/food, oxygen, time of day, current activity and running reflex (e.g. "fighting zombie", "eating bread"), held item, worn armor, inventory, nearby players and the nearest hostile mob.',
     inputSchema: {}
   }, async () => run('get_state', {}, () => a.state()))
 
@@ -64,9 +64,29 @@ function buildServer (a: Actions): McpServer {
   }, async (args) => run('look_at_player', args, () => a.lookAt(args.player)))
 
   s.registerTool('stop', {
-    description: 'Stop whatever you are doing (following, walking, mining).',
+    description: 'Stop whatever you are doing (following, walking, mining). Reflexes (fighting a mob that is attacking you, escaping water/lava) cannot be stopped; they end on their own in seconds.',
     inputSchema: {}
   }, async () => run('stop', {}, () => a.stop()))
+
+  s.registerTool('equip', {
+    description: 'Hold an inventory item in your hand (or off-hand), or wear it if it is armor. Use Minecraft ids, e.g. iron_axe, shield, diamond_helmet; `*` wildcards work (*_sword). You do NOT need this for fighting or armor: your reflexes already pick the best weapon in a fight and wear the best armor you carry.',
+    inputSchema: { item: z.string().min(1), hand: z.enum(['hand', 'off-hand']).default('hand').describe('Ignored for armor') }
+  }, async (args) => run('equip', args, () => a.equip(args.item, args.hand)))
+
+  s.registerTool('eat', {
+    description: 'Eat food from your inventory. Omit item to eat the best safe food. Refuses when not hungry, and skips harmful foods (rotten_flesh, spider_eye, poisonous_potato, pufferfish) unless you name them. You do NOT need this to survive: your reflexes already eat when hungry or hurt.',
+    inputSchema: { item: z.string().min(1).optional() }
+  }, async (args) => run('eat', args, () => a.eat(args.item)))
+
+  s.registerTool('give', {
+    description: 'Walk to a player and throw them items from your inventory (e.g. give steve 3 oak_log). Waits until done.',
+    inputSchema: { item: z.string().min(1), count: z.number().int().min(1).max(2304).default(1), player }
+  }, async (args) => run('give', args, () => a.give(args.item, args.count, args.player)))
+
+  s.registerTool('drop', {
+    description: 'Throw items from your inventory on the ground in front of you.',
+    inputSchema: { item: z.string().min(1), count: z.number().int().min(1).max(2304).default(1) }
+  }, async (args) => run('drop', args, () => a.drop(args.item, args.count)))
 
   s.registerTool('respawn', {
     description: 'Respawn after dying.',

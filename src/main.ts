@@ -4,10 +4,13 @@ import { loadConfig } from './config.js'
 import { log } from './log.js'
 import { MatrixBridge } from './matrix.js'
 import { startMcpServer } from './mcp.js'
+import { Reflexes } from './reflexes.js'
 
 const cfg = loadConfig()
 const body = new Body(cfg.mc)
 const actions = new Actions(body, cfg.defaultPlayer)
+// Self-preservation (fight, eat, escape, armor): pure code, every tick, no LLM.
+new Reflexes(body, actions)
 
 let matrix: MatrixBridge | null = null
 if (cfg.matrix) {
