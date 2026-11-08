@@ -272,6 +272,17 @@ export class Actions {
     return true
   }
 
+  /**
+   * Hand the slot to the cerebellum's plan (set_plan): cancel any outside
+   * activity (follow, go_to...) and forget a follow a reflex would resume,
+   * so the plan doesn't wait behind it forever. Never pre-empts a running
+   * reflex and does not notify stop listeners (that would pause the plan).
+   */
+  yieldToPlan (): void {
+    this.resumeFollow = null
+    if (!this.slotReflex && this.activity !== 'idle') this.begin('idle')
+  }
+
   /** Walk until at least `distance` blocks from `from` (e.g. away from a creeper). */
   async fleeFrom (from: { x: number, y: number, z: number }, label: string, distance: number): Promise<string> {
     const gen = this.claim(`fleeing ${label}`)

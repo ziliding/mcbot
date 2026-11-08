@@ -81,9 +81,9 @@ function buildServer (d: McpDeps): McpServer {
     const errors = checkGatherBlocks(args.steps, d.blockNames, blockPattern)
     if (errors.length) throw new ActionError(errors.join('\n'))
     // Take over from an outside activity (a follow, go_to...), which the
-    // cerebellum would otherwise leave alone. Never pre-empts a reflex, and
-    // cancel() does not count as a "stop" (which would pause the new plan).
-    if (!a.slotReflex && a.activity !== 'idle') a.cancel(a.currentGeneration)
+    // cerebellum would otherwise leave alone, including a follow a running
+    // reflex would resume afterwards.
+    a.yieldToPlan()
     d.plans.set({ goal: args.goal, steps: args.steps })
     return { ok: true, note: a.slotReflex ? `starts after the reflex (${a.slotReflex}) ends` : 'started', plan: planSummary(d) }
   }))
