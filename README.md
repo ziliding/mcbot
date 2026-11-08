@@ -1,7 +1,7 @@
 # uta-mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
-The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip) is verified. M2 (MCP over HTTP in the same process) is built, but the check from the Matrix room hasn't run yet.**
+The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process) and M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) are done.** M3 was tested from the server console; the in-game check with a player is still to do (see below).
 
 ## Layout
 
@@ -17,10 +17,25 @@ Source is in `src/` (strict TypeScript):
 - `body.ts` owns the one mineflayer instance, reconnects with backoff, parses player chat, and paces outgoing chat (256-char limit, newline split, never sends a line starting with `/`).
 - `matrix.ts` is a minimal client-server API client: whoami, join, long-poll `/sync`. It waits 1.5 s after the last edit so streamed replies are sent once, complete.
 - `main.ts` wires them together: game chat → `[MC] <player>: <text>` in the room, and room messages from allowed senders → game chat.
-- `actions.ts` holds the bot's verbs: state, come, follow, go_to, mine (with `*` wildcards, e.g. `*_log`), look, stop, respawn. A movement verb cancels the one before it.
+- `actions.ts` holds the bot's verbs: state, come, follow, go_to, mine (with `*` wildcards, e.g. `*_log`), look, equip, eat, give, drop, stop, respawn. A movement verb cancels the one before it. Everything that uses the held item (equip, eat, toss, tool swaps) runs one at a time.
+- `reflexes.ts` is the reflex layer (M3). It runs on every physics tick, makes no LLM or MCP calls, and never chats. Highest priority first:
+  1. Escape lava, fire and deep water (when its air drops).
+  2. Fight hostile mobs within 8 blocks, and anything that hits it. It equips its best sword or axe and only hits at full attack strength. It leaves endermen and piglins alone unless they attack, and never fights players.
+  3. Eat the best safe food when food ≤ 14, or when health ≤ 14 and food < 20.
+  4. Wear the best armor it carries.
+
+  Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, movement tools answer `busy: …`, and an interrupted `go_to` or `mine_block` fails with `interrupted by fighting zombie`. An interrupted follow resumes by itself.
+- `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank.
 - `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools. It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
 
-Every tool call is logged as an `mcp.call` event, with its arguments, duration and result.
+Every tool call is logged as an `mcp.call` event, with its arguments, duration and result. Reflexes log `reflex.fight`, `reflex.eat`, `reflex.escape`, `reflex.armor` and `reflex.resume`.
+
+Why reflexes are hand-written rather than plugins (checked against mineflayer 4.39 and MC 26.1):
+- `mineflayer-pvp` 1.3.2 (2022) calls `pathfinder.stop()`, which kills the next goto.
+- `mineflayer-armor-manager` 2.0.1 (2023) has a hardcoded armor table with no copper armor.
+- `mineflayer-auto-eat` 5.0.3 does load and read the 26.1 food registry. But it equips and eats on its own loop, independent of the activity slot, so it would swap items mid-fight or mid-dig.
+
+Also, don't use `bot.oxygenLevel` in 4.39: it is overwritten by any nearby entity's air supply. `items.ts` `ownOxygen()` reads the bot's own metadata.
 
 Loop prevention: the bot ignores its own game messages (by uuid and by name) and its own Matrix messages. System, death and join lines are not forwarded.
 
@@ -67,6 +82,22 @@ The server is stateless, so restarting Hermes or the bot never strands a session
 Two things about Hermes sessions:
 - **Tool lists are fixed per session.** A session keeps the tool list it started with. After adding or changing the MCP server, send `/new` in the game room to start a fresh session.
 - **One conversation per room.** For this, set `group_sessions_per_user: false` in the root `~/.hermes/config.yaml` (the root config is the only place it's read), then restart the gateway. Its default, `true`, keeps a separate session per sender. Game chat, relayed by `@mcbot`, and your own messages in Element share one Hermes session. Each line still says who spoke: `[MC] steve: …` or your own name.
+
+## M3 check (in game)
+
+Tested from the server console, with no MCP or LLM calls in the logs:
+- A summoned zombie and skeleton were killed with an auto-equipped iron sword.
+- Under the Hunger effect it ate bread from food 0 to 20 and skipped the rotten flesh.
+- Teleported to the bottom of a 5-deep river, it surfaced and walked ashore in about 5 s.
+- It stepped out of fire (0.6 s) and lava (4 s).
+- Armor was worn automatically.
+
+Still to check with a player online:
+1. `follow_player`, then a zombie: the bot fights, then resumes following.
+2. `give` hands items to you.
+3. Hermes uses `equip`/`eat` instead of narrating them.
+
+Watch `docker compose logs -f mcbot | grep reflex`.
 
 ## M1 check
 
