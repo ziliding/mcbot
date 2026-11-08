@@ -1,0 +1,14 @@
+{
+  "name": "uta-mcbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless Minecraft Java bot bridge (mineflayer) driven by a JSONL command queue",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "mineflayer": "4.39.0",
+    "mineflayer-pathfinder": "^2.4.5"
+  }
+}
