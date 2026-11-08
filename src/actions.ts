@@ -66,6 +66,8 @@ export class Actions {
   private hands: Promise<unknown> = Promise.resolve()
   private handsQueued = 0
   private readonly stopListeners: Array<() => void> = []
+  /** Furnace the last smelt used: an interrupted smelt's output waits there. */
+  private lastFurnace: Bot['entity']['position'] | null = null
 
   constructor (private readonly body: Body, private readonly defaultPlayer: string) {
     body.on('spawn', (bot) => {
@@ -96,6 +98,9 @@ export class Actions {
     // sets a flag that lingers and kills the *next* goto ("Path was stopped").
     bot.pathfinder.setGoal(null)
     if (bot.targetDigBlock) bot.stopDigging()
+    // A furnace or crafting-table window left open would make the next
+    // equip (a reflex grabbing its sword) click that window's slots.
+    if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch { /* already closed */ } }
     this.activity = activity
     this.interruptedBy = activity
     this.following = null
@@ -361,6 +366,13 @@ export class Actions {
         const fresh = bot.blockAt(block.position)
         if (!fresh || !ids.includes(fresh.type)) continue
         if (!bot.canDigBlock(fresh)) throw new ActionError(`can't dig the ${blockName} at ${fresh.position.toString()} from here`)
+        // Stone and ores drop nothing without the right pickaxe: say so instead of digging forever.
+        const tools = bot.registry.blocks[fresh.type]?.harvestTools
+        if (tools && !bot.inventory.items().some((i) => tools[String(i.type)])) {
+          const names = Object.keys(tools).map((id) => bot.registry.items[Number(id)]?.name).filter((n): n is string => !!n)
+          const weakest = names.sort((a, b) => PICK_ORDER.indexOf(a.split('_')[0] ?? '') - PICK_ORDER.indexOf(b.split('_')[0] ?? ''))[0] ?? 'a pickaxe'
+          throw new ActionError(`need a tool: ${fresh.name} drops nothing without ${weakest} or better; craft one first`)
+        }
         await this.withHands('equip tool', () => this.equipBestTool(fresh))
         try {
           await bot.dig(fresh, true)
@@ -642,6 +654,7 @@ export class Actions {
         block = await this.placeIn(gen, 'furnace')
         notes.push(`placed a furnace at ${fmtPos(block.position)}`)
       }
+      this.lastFurnace = block.position.clone()
       await this.reach(gen, block)
       if (!this.stillCurrent(gen)) throw this.interrupted()
       const f = await withTimeout(bot.openFurnace(block), 5_000, 'opening the furnace took too long')
@@ -710,15 +723,24 @@ export class Actions {
         (foreign ? `; also took out ${foreign}` : '') + (notes.length ? `; ${notes.join('; ')}` : '')
       if (collected === 0) throw new ActionError(`nothing came out: ${msg}`)
       return msg
+    } catch (e) {
+      // A window op in flight when a reflex closed the furnace fails oddly: report the interruption.
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      throw e instanceof ActionError ? e : new ActionError(`smelting failed: ${errText(e)}`)
     } finally {
-      if (furnace) { try { furnace.close() } catch { /* closed already */ } }
+      if (furnace && this.stillCurrent(gen)) { try { furnace.close() } catch { /* closed already */ } }
       this.finish(gen)
     }
   }
 
+  /** A furnace within 16 blocks, else the last one used if it is still there (within 64). */
   private findFurnace (bot: Bot): Block | null {
-    const ids = ['furnace'].map((n) => bot.registry.blocksByName[n]?.id).filter((i): i is number => i !== undefined)
-    return bot.findBlock({ matching: ids, maxDistance: 16 })
+    const id = bot.registry.blocksByName.furnace?.id
+    if (id === undefined) return null
+    const near = bot.findBlock({ matching: id, maxDistance: 16 })
+    if (near) return near
+    const last = this.lastFurnace ? bot.blockAt(this.lastFurnace) : null
+    return last && last.type === id && last.position.distanceTo(bot.entity.position) <= 64 ? last : null
   }
 
   /** One fuel type from the inventory that covers `units` items. */
@@ -829,6 +851,9 @@ export class Actions {
 }
 
 type Vec3Like = Bot['entity']['position']
+
+/** Tool tiers, weakest first (for "needs a stone_pickaxe or better"). */
+const PICK_ORDER = ['wooden', 'golden', 'stone', 'copper', 'iron', 'diamond', 'netherite']
 
 const NEIGHBORS: Array<[number, number, number]> = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]
 

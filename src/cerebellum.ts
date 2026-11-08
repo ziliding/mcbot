@@ -465,7 +465,7 @@ export class Cerebellum {
     const step = this.plans.active
     if (!step || stepIndex !== this.plans.stepIndex) return
     // Missing materials or fuel won't fix themselves by retrying.
-    if (/^dug \d+\/\d+ .*no more|^unknown (block|item)|is not online|no other player|^can't (craft|smelt)|^nothing came out/.test(msg)) {
+    if (/^dug \d+\/\d+ .*no more|^unknown (block|item)|is not online|no other player|^can't (craft|smelt)|^nothing came out|^need a tool/.test(msg)) {
       this.infeasible(step, msg)
     } else if (++this.failures >= 2) {
       this.plans.pause(`step failed twice: ${msg}`)

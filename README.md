@@ -163,6 +163,7 @@ Three verbs in `actions.ts`, as MCP tools and as plan steps. Each takes the acti
   - Smelted or mined items (ingots, coal, diamonds) are base materials, never "crafted" from their storage block.
   - 3×3 recipes use a crafting table within 16 blocks (it walks over), or it crafts one from planks and places it next to the bot.
   - On failure: `can't craft 1 iron_pickaxe: need 1 more iron_ingot (have 2); have: …`.
+- `begin()` closes any open container window when something new claims the slot. Otherwise a reflex's sword equip would click the furnace's slots.
 - **`smelt {item, count, fuel?}`**: `item` is the input (`raw_iron`, `*_log`) or the output (`iron_ingot`, `charcoal`).
   - Uses a furnace within 16 blocks, or crafts one from 8 cobblestone (through `craft`, so a table is made if needed) and places it.
   - Fuel is one type from the bag, best first: coal, charcoal, planks, logs, sticks. It never burns the input itself (no logs as fuel when making charcoal).
@@ -183,15 +184,26 @@ Cerebellum: `CRAFT` and `SMELT` join the behavior choice (GATHER/CRAFT/SMELT/MOV
 Verified over MCP against the live bot (26.1, difficulty easy), with materials from `give mcbot …`:
 - craft `*_planks` 4 → `stick` 4 → `crafting_table` 1 → `place_block crafting_table` (auto spot) → `wooden_pickaxe` 1 at the placed table.
 - From 3 birch logs and no table within 16 blocks: `craft wooden_pickaxe` made planks, a table, sticks, placed the table and crafted the pickaxe in 2.1 s.
-- `smelt iron_ingot 3` with no furnace near: crafted a furnace from 8 cobblestone at the table, placed it, loaded 3 raw_iron + 1 coal, and 31 s later took 3 iron_ingot.
-  - A first attempt was interrupted when the cerebellum fled a creeper (`interrupted by fleeing creeper`). The placed furnace was reused on the retry.
+- `smelt iron_ingot 3` with no furnace near (night, mobs about), three calls:
+  1. The first crafted a furnace from 8 cobblestone at the nearby table and placed it. The cerebellum then fled a creeper: `interrupted by fleeing creeper`.
+  2. The second came from 21 blocks away. It found no furnace within 16 and tried to craft a new one: `need 8 more cobblestone`.
+  3. After a manual `go_to` back, the third loaded 3 raw_iron + 1 coal and 31 s later took 3 iron_ingot.
+  
+  Smelt now remembers the furnace it used last and goes back to it if it is within 64 blocks.
+- Interrupt and re-entry: a zombie was summoned 4 blocks away during a smelt. The furnace window was closed on pre-empt, the reflex equipped its `stone_sword`, and smelt failed with `interrupted by fighting zombie`.
+  - The next `smelt raw_iron 3` collected the 3 ingots waiting in the furnace.
+  - In a second run, the re-entry counted the 2 raw_iron still loaded (`loaded 2, add 0`), and a last call collected the rest.
+- `mine_block iron_ore` with only a wooden pickaxe: `need a tool: iron_ore drops nothing without stone_pickaxe or better; craft one first`. This used to dig forever with `+0`. In a plan it pauses the gather step as `step stuck`.
 - Plan `gather 3 *_log → craft 1 wooden_pickaxe → craft 2 stick`: Jev chose `CRAFT` (p 0.99) for each craft step. Every step was completed by code, then `plan_done`.
 - Plan `smelt 2 raw_iron → craft 1 stone_pickaxe`: done.
 - Plan `craft 1 diamond_pickaxe`: paused at once with `can't craft 1 diamond_pickaxe: need 3 more diamond (have 0)`.
 - `set_plan` refused `craft iron_ingot`, `craft woden_pickaxe` and `smelt dirt` with readable errors.
 - `place_block torch` at explicit coordinates and at an auto spot. It refused an occupied cell (`-46 84 -2 is not empty (dirt)`) and an unsupported one (`nothing solid next to …`).
 
-Test blocks were removed with `setblock … air` and the bot's inventory restored afterwards.
+Test blocks (two tables, two furnaces, two torches) were removed with `setblock … air`, and the bot's inventory was restored afterwards. During testing:
+- the time was set to day and not set back;
+- the bot's pathing dug some terrain and used dirt and cobblestone as scaffolding;
+- the zombie tests cost it health (topped up with instant_health).
 
 ## M5 check
 
