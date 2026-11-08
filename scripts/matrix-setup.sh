@@ -2,21 +2,28 @@
 # One-time Matrix setup for the bot. Run it yourself from the repo root:
 #   scripts/matrix-setup.sh
 #
-# 1. Registers the bot's own account (default @uta-mc) with the homeserver's
-#    registration token, or logs in if it already exists.
-# 2. Creates an UNENCRYPTED room and invites Hermes (@luna) and you.
-# 3. Writes MATRIX_ACCESS_TOKEN / MATRIX_ROOM / MATRIX_ALLOWED_SENDERS into ./.env.
-# 4. Optionally updates Hermes's luna profile so it answers the bot without @-mentions.
+# The "brain" is a Hermes profile (PERSONA, default nova). The bot's body has
+# its own persona-neutral account, so you can swap brains without a new one:
+#   PERSONA=luna scripts/matrix-setup.sh
 #
+# 1. Registers the body's account (default @mcbot) with the homeserver's
+#    registration token, or logs in if it already exists.
+# 2. Creates an UNENCRYPTED room and invites the persona (e.g. @nova) and you.
+# 3. Writes MATRIX_ACCESS_TOKEN / MATRIX_ROOM / MATRIX_ALLOWED_SENDERS into ./.env.
+# 4. Optionally updates the persona's Hermes profile so it answers the bot without @-mentions.
+#
+# Re-running with an existing account just logs in and makes a new room.
 # Nothing secret is printed. Needs curl and jq.
 set -euo pipefail
 
+PERSONA="${PERSONA:-nova}"
 HS="${HS:-http://127.0.0.1:6167}"
 SERVER_NAME="${SERVER_NAME:-example.com}"
-HERMES_ID="${HERMES_ID:-@luna:$SERVER_NAME}"
+HERMES_ENV="${HERMES_ENV:-$HOME/.hermes/profiles/$PERSONA/.env}"
+HERMES_ID="${HERMES_ID:-$(grep -E '^MATRIX_USER_ID=' "$HERMES_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+HERMES_ID="${HERMES_ID:-@$PERSONA:$SERVER_NAME}"
 HUMAN_ID="${HUMAN_ID:-@you:$SERVER_NAME}"
 MATRIX_COMPOSE="${MATRIX_COMPOSE:-$HOME/projects/apps/matrix/docker-compose.yml}"
-HERMES_ENV="${HERMES_ENV:-$HOME/.hermes/profiles/luna/.env}"
 BOT_ENV="${BOT_ENV:-.env}"
 
 die () { echo "error: $*" >&2; exit 1; }
@@ -51,9 +58,10 @@ command -v jq >/dev/null || die "jq is required (brew install jq)"
 curl -sf "$HS/_matrix/client/versions" >/dev/null || die "homeserver not reachable at $HS"
 
 echo "== Bot account"
-LOCALPART=$(ask "Bot localpart (must differ from Hermes's ${HERMES_ID%%:*})" "uta-mc")
+LOCALPART=$(ask "Body account localpart (persona-neutral, not a Hermes profile account)" "mcbot")
 BOT_ID="@$LOCALPART:$SERVER_NAME"
-[[ "$BOT_ID" != "$HERMES_ID" ]] || die "$BOT_ID is Hermes's own account; pick another name"
+grep -qsxF "MATRIX_USER_ID=$BOT_ID" "$HOME"/.hermes/profiles/*/.env && die "$BOT_ID is a Hermes profile's account; pick another name"
+[[ "$BOT_ID" != "$HERMES_ID" ]] || die "$BOT_ID is the persona's account"
 
 read -r -s -p "Password for $BOT_ID (new account: choose one; existing: enter it): " PASS; echo
 [[ -n "$PASS" ]] || die "empty password"
@@ -79,7 +87,7 @@ fi
 unset PASS PASS2 REG_TOKEN
 TOKEN=$(jq -r '.access_token // empty' <<<"$RES")
 [[ -n "$TOKEN" ]] || die "no access token: $(jq -r '.errcode + " " + (.error // "")' <<<"$RES")"
-api PUT "/profile/$(jq -rn --arg x "$BOT_ID" '$x|@uri')/displayname" '{"displayname":"luna (Minecraft body)"}' >/dev/null || true
+api PUT "/profile/$(jq -rn --arg x "$BOT_ID" '$x|@uri')/displayname" '{"displayname":"Minecraft body"}' >/dev/null || true
 
 echo "== Room"
 INVITE=("$HERMES_ID")
@@ -89,7 +97,7 @@ if confirm "Invite yourself ($HUMAN_ID) too, so you can watch and talk in the ro
 else
   GROUP=0  # 2 members: Hermes treats it as a DM (no mention needed)
 fi
-CREATE=$(jq -nc --args '{name:"luna · Minecraft",topic:"Game chat bridge for the luna Minecraft bot",preset:"private_chat",invite:$ARGS.positional}' "${INVITE[@]}")
+CREATE=$(jq -nc --arg p "$PERSONA" --args '{name:($p + " · Minecraft"),topic:("Game chat bridge for " + $p + " in Minecraft"),preset:"private_chat",invite:$ARGS.positional}' "${INVITE[@]}")
 ROOM_ID=$(api POST /createRoom "$CREATE" | jq -r '.room_id // empty')
 [[ -n "$ROOM_ID" ]] || die "createRoom failed"
 ENC=$(curl -s -o /dev/null -w '%{http_code}' -H "authorization: Bearer $TOKEN" \
@@ -106,12 +114,12 @@ echo "  wrote MATRIX_ACCESS_TOKEN, MATRIX_ROOM, MATRIX_ALLOWED_SENDERS"
 unset TOKEN
 
 echo "== Hermes profile ($HERMES_ENV)"
-if [[ -f "$HERMES_ENV" ]] && confirm "Update Hermes's luna profile (backup is made first)?"; then
+if [[ -f "$HERMES_ENV" ]] && confirm "Update Hermes's $PERSONA profile (backup is made first)?"; then
   cp "$HERMES_ENV" "$HERMES_ENV.bak.$(date +%Y%m%d%H%M%S)"
   add_csv "$HERMES_ENV" MATRIX_ALLOWED_USERS "$BOT_ID"
   if [[ $GROUP == 1 ]]; then
     add_csv "$HERMES_ENV" MATRIX_FREE_RESPONSE_ROOMS "$ROOM_ID"
-    if confirm "Set MATRIX_SESSION_SCOPE=room (one continuous session per room instead of per-thread; affects all of luna's group rooms)?"; then
+    if confirm "Set MATRIX_SESSION_SCOPE=room (one continuous session per room instead of per-thread; affects all of $PERSONA's group rooms)?"; then
       set_kv "$HERMES_ENV" MATRIX_SESSION_SCOPE room; echo "  MATRIX_SESSION_SCOPE=room"
     fi
   fi

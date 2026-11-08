@@ -33,7 +33,7 @@ export function loadConfig (): Config {
     mc: {
       host: env('MC_HOST', 'mc'),
       port: Number(env('MC_PORT', '25565')),
-      username: env('MC_NAME', 'luna'),
+      username: env('MC_NAME', 'mcbot'),
       version: env('MC_VER', '26.1')
     },
     defaultPlayer: env('MC_DEFAULT_PLAYER', 'steve'),
