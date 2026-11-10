@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "description": "Minecraft companion bot: mineflayer body, Matrix bridge to Hermes",
+  "license": "MIT",
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
