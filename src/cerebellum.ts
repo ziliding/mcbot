@@ -1,5 +1,6 @@
 import { choice, noul } from '@typesafe-ai/sdk'
-import { ActionError, type Actions } from './actions.js'
+import { ActionError, SHELTER_ACTIVITY, type Actions } from './actions.js'
+import { isEnclosed } from './surroundings.js'
 import type { Body } from './body.js'
 import type { Jev } from './jev.js'
 import { log } from './log.js'
@@ -282,7 +283,9 @@ export class Cerebellum {
     const planned = external ? null : this.planBehavior(step)
     if (planned) avail.add(planned)
     const h = snap.nearestHostile
-    if (h && AVOID_MOBS.has(h.name) && h.distance <= 10) avail.add('FLEE')
+    // Not from a shelter (or while digging one): the flee path would dig us out.
+    const hiding = this.actions.activity === SHELTER_ACTIVITY || isEnclosed(bot)
+    if (h && AVOID_MOBS.has(h.name) && h.distance <= 10 && !hiding) avail.add('FLEE')
     const hungry = (snap.food ?? 20) <= 16 || ((snap.health ?? 20) <= 14 && (snap.food ?? 20) < 20)
     const hasFood = Object.keys(snap.inventory).some((n) => bot.registry.foodsByName[n] && n !== 'rotten_flesh')
     if (hungry && hasFood && !this.actions.sideReflex && !this.actions.handsBusy) avail.add('EAT')

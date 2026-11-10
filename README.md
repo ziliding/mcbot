@@ -1,7 +1,7 @@
 # uta-mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
-The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done, plus crafting, smelting and block placement (`craft`, `smelt`, `place_block`, and `craft`/`smelt` plan steps).** M6 (ops/observability: traces, reconnect hardening) is next.
+The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done, plus crafting, smelting and block placement (`craft`, `smelt`, `place_block`, and `craft`/`smelt` plan steps), and surroundings, shelter and low-health retreat (`get_state.surroundings`, `shelter`).** M6 (ops/observability: traces, reconnect hardening) is next.
 
 ## Layout
 
@@ -20,18 +20,20 @@ Source is in `src/` (strict TypeScript):
 - `actions.ts` holds the bot's verbs: state, come, follow, go_to, mine (with `*` wildcards, e.g. `*_log`), look, equip, eat, give, drop, stop, respawn. A movement verb cancels the one before it. Everything that uses the held item (equip, eat, toss, tool swaps) runs one at a time.
 - `reflexes.ts` is the reflex layer (M3). It runs on every physics tick, makes no LLM or MCP calls, and never chats. Highest priority first:
   1. Escape lava, fire and deep water (when its air drops).
-  2. Fight hostile mobs within 8 blocks, and anything that hits it. It equips its best sword or axe and only hits at full attack strength. It never attacks creepers or wardens. It leaves endermen and piglins alone unless they attack. It never fights players, golems or villagers, and never blames unattributed damage (falls, starving) on a bystander.
-  3. Eat the best safe food when food ≤ 14, or when health ≤ 14 and food < 20.
-  4. Wear the best armor it carries.
+  2. Retreat when health ≤ 8 and a hostile mob (or whatever just hit it) is within 12 blocks: it ends any fight and runs until 20 blocks away. If it can't get away, it fights back for 8 s before trying again. Not while sheltered. When the threat is an archer (skeleton, pillager, witch…), or it already retreated twice within 45 s, it digs in with `shelter` instead (`reflex.shelter`), pauses any plan and posts `[EVENT] took shelter`. If no shelter spot is found it goes back to retreating for 30 s.
+  3. Fight hostile mobs within 8 blocks, and anything that hits it. At health ≤ 12 it only hits back, and flyers (phantoms, ghasts, blazes, vexes) are only hit when within reach, never chased. It equips its best sword or axe and only hits at full attack strength. It never attacks creepers or wardens. It leaves endermen and piglins alone unless they attack. It never fights players, golems or villagers, and never blames unattributed damage (falls, starving) on a bystander.
+  4. Eat the best safe food when food ≤ 14, or when health ≤ 14 and food < 20.
+  5. Wear the best armor it carries.
 
-  Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, movement tools answer `busy: …`, and an interrupted `go_to` or `mine_block` fails with `interrupted by fighting zombie`. An interrupted follow resumes by itself.
+  Fighting and escaping take the activity slot: `get_state.activity` shows `fighting zombie`, and MCP tools wait it out instead of failing: a call made during a reflex starts when it ends (up to 30 s), and `go_to`, `come_to_player`, `mine_block` (for what's still missing), `give` and `place_block` carry on after one (`mcp.resume`; the result ends with `(paused 1x for fighting husk, then carried on)`). `craft` and `smelt` only wait before they start. A newer command, `stop` or a plan taking the slot still ends a call. `follow_player` during a reflex is queued and starts when it ends. The cerebellum and local chat commands still see `busy:` / `interrupted by …` as before. An interrupted follow resumes by itself.
 - `cerebellum.ts` is the cerebellum (M4), see below. `jev.ts` wraps the TypeSafe SDK (timeouts, logging, cost), `plan.ts` holds the typed plan model, `worldstate.ts` builds the compact state Jev reads, and `triage.ts` decides which chat lines the body answers itself.
+- `surroundings.ts` describes the blocks around the body in words for `get_state`, and finds shelter spots (see *Surroundings and shelter*).
 - `items.ts` is the item knowledge the reflexes and verbs share: food quality, weapon damage, armor rank, and what a mined block drops (`iron_ore` → `raw_iron`) for gather progress.
 - `crafting.ts` is crafting and smelting knowledge, pure: the smelting and fuel tables, and the crafting resolver (see *Making things*).
 - `mcp.ts` is a stateless MCP Streamable HTTP server at `/mcp` that exposes those verbs as tools, plus the plan tools (M5). It requires `Authorization: Bearer $MCP_TOKEN`. `/health` takes no auth.
 - `events.ts` posts `[EVENT] …` escalations to the room (coalesced, rate-limited); `lookout.ts` spots rare ores for "notable find" events.
 
-Every tool call is logged as an `mcp.call` event, with its arguments, duration and result. Reflexes log `reflex.fight`, `reflex.eat`, `reflex.escape`, `reflex.armor` and `reflex.resume`.
+Every tool call is logged as an `mcp.call` event, with its arguments, duration and result. Reflexes log `reflex.fight`, `reflex.retreat`, `reflex.eat`, `reflex.escape`, `reflex.armor`, `reflex.shelter` and `reflex.resume`; a tool carrying on after a reflex logs `mcp.resume`.
 
 Why reflexes are hand-written rather than plugins (checked against mineflayer 4.39 and MC 26.1):
 - `mineflayer-pvp` 1.3.2 (2022) calls `pathfinder.stop()`, which kills the next goto.
@@ -178,6 +180,44 @@ Three verbs in `actions.ts`, as MCP tools and as plan steps. Each takes the acti
 - **Gather progress counts drops:** a `gather iron_ore` step now completes on `raw_iron`, and `stone` on `cobblestone`. Before, those steps could never complete.
 
 Cerebellum: `CRAFT` and `SMELT` join the behavior choice (GATHER/CRAFT/SMELT/MOVE_TO map 1:1 to the step kinds). Step completion is the code-measured inventory delta of the item (craft), or of the output (smelt: `iron_ingot` for `raw_iron`). A craft or smelt that fails for missing materials or fuel pauses the plan at once with `step stuck` (retrying won't conjure materials). `!plan pickaxe` is a preset: gather 3 `*_log`, then craft a `wooden_pickaxe`.
+
+## Surroundings and shelter
+
+Before this, the brain could not see blocks at all. Asked to hide at night, it ran `mine_block dirt` (which digs the nearest dirt anywhere, not under its feet) and `place_block` at guessed coordinates. It was standing in a birch tree, so half the placements hit leaves, stone or gravel, and it never got a shelter. It then fist-fought zombies down to 1.5 health and died to a skeleton.
+
+- **`get_state.surroundings`** (`surroundings.ts`, computed only for the MCP call, not for Jev):
+  - `standing_on` and `footing`: ground, tree, loose (sand/gravel), water, lava or in the air.
+  - `ground_below` when up a tree or in the air, e.g. `grass_block 10 blocks down`.
+  - `sides`: north/south/east/west at feet and head height, e.g. `open`, `open, drop of 5+`, `wall (dirt)`, `half-blocked (…)`.
+  - `overhead` (`open sky` or e.g. `pale_oak_leaves 7 above`), `sheltered`, and the 8 most common blocks within 3.
+- **`shelter`** (MCP tool, `Actions.shelter`):
+  - Finds natural ground within 16 blocks (dirt/stone, not tree, sand or gravel). The column must be 3 deep with solid walls, a solid floor and no liquid next to it.
+  - Walks there and centers on the block, digs 3 straight down, and plugs the top with the cheapest block it carries (dirt, cobblestone, planks…). The body ends up in a closed 1×1, 2-high pit.
+  - It refuses up front if it has no cover block and the pit won't yield one. It waits up to 15 s for a running fight or retreat to finish instead of answering `busy`.
+  - An active plan is paused, since the plan would dig the body out. It is resumed if the shelter fails.
+- **While sheltered or digging in:**
+  - No proactive fights; it only hits back at a mob within reach.
+  - No retreat, and no cerebellum FLEE.
+  - It eats even with mobs right outside.
+- **Getting out:** the pathfinder's way up a 1×1 shaft (placing blocks under itself) stalls on 26.1, so `goto` first digs a staircase toward the target (`climb.out`), whenever the only way out is 2+ blocks up. `go_to`, `come_to_player`, `follow_player`, mining and plan steps all go through it.
+
+## Surroundings and shelter check
+
+Live bot on 26.1 (difficulty easy), only mcbot online:
+- Teleported onto a pale oak canopy: `footing: tree`, `ground_below: grass_block 10 blocks down`, every side `open`. On flat ground, walls and the canopy 7 above read correctly.
+- `shelter` from the canopy (day): down to the ground, dug in at `2 132 -2` and sealed with dirt in 7.4 s, `sheltered: true`. At night with mobs about: 4.7 s.
+- Two zombies summoned next to the closed pit, plus the hunger effect: no fight, and it ate 3 bread in the pit.
+- Before the staircase fix, `go_to` out of the pit gave up after 120 s (it towered one block and stalled). With it: `climb.out`, then arrived in 8.9 s.
+- `/damage` to 6 with a zombie 4 blocks away: `reflex.retreat` to 19.7 blocks in 4.7 s, then it ate. A creaking then hit it at 4.5 health: it retreated again (the attacker came from the hit) and healed to 17.
+
+Not checked: the refusals (no spot within 16, no cover block), and retreating from a skeleton that is shooting from more than 12 blocks.
+
+Waiting out reflexes (live, day, only mcbot online):
+- `mine_block stone 5`, husk summoned 3 s in: the fight interrupted it, `mcp.resume`, and the call returned with 5 stone gathered after one pause (13 s).
+- At 8.5 health, night, skeleton 9 blocks away: it was shot to 5.8, `reflex.shelter` dug in and sealed in 4.6 s, `[EVENT] took shelter` posted.
+- `go_to` 15 blocks from that pit with a husk summoned on the way: climbed out, fought, carried on, arrived in 11 s. `follow_player` during a fight was queued and started when the fight ended.
+- A phantom summoned 5 blocks away at full health: no fight.
+- At 8 health with three husks around: two retreats got it clear, so no shelter was needed.
 
 ## Crafting check
 

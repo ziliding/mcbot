@@ -8,6 +8,7 @@ import type { Furnace } from 'mineflayer'
 import { SMELT_SECONDS, describeMissing, fuelRank, fuelUnits, resolveCraft, smeltSpec, wildcard, type CraftCall } from './crafting.js'
 import { BAD_FOODS, armorSlot, armorUpgrades, bestFood, bestWeapon, countGathered, findItems, ownOxygen, wornArmor } from './items.js'
 import { log } from './log.js'
+import { LOOSE, describeSurroundings, findShelterSpot, isEnclosed, isLiquid, isOpen, isSolidBlock, type Surroundings } from './surroundings.js'
 
 const { goals, Movements } = pathfinderPkg
 
@@ -36,6 +37,9 @@ export interface WorldStateSnapshot {
   nearestHostile: { name: string, distance: number } | null
 }
 
+/** Activity name while shelter() digs in: reflexes and the cerebellum leave it alone. */
+export const SHELTER_ACTIVITY = 'digging in to hide'
+
 /** Items that can be consumed at full hunger. */
 const ALWAYS_EDIBLE = new Set(['golden_apple', 'enchanted_golden_apple', 'milk_bucket', 'potion'])
 
@@ -60,12 +64,15 @@ export class Actions {
   /** Reflex running without the slot (e.g. eating while following), or null. */
   sideReflex: string | null = null
   private generation = 0
+  /** Bumped by every claim that isn't a reflex (commands, plans, stop, a resumed follow, respawn). */
+  private claimSeq = 0
   private interruptedBy = ''
   private following: { name: string, distance: number } | null = null
   private resumeFollow: { name: string, distance: number } | null = null
   private hands: Promise<unknown> = Promise.resolve()
   private handsQueued = 0
   private readonly stopListeners: Array<() => void> = []
+  private readonly hideListeners: Array<(text: string) => void> = []
   /** Furnace the last smelt used: an interrupted smelt's output waits there. */
   private lastFurnace: Bot['entity']['position'] | null = null
 
@@ -82,6 +89,7 @@ export class Actions {
       this.following = null
       this.resumeFollow = null
       this.generation++
+      this.claimSeq++
     })
   }
 
@@ -92,7 +100,7 @@ export class Actions {
   }
 
   /** Cancel the running activity and claim the slot for a new one. */
-  private begin (activity: string): number {
+  private begin (activity: string, reflex = false): number {
     const bot = this.bot()
     // setGoal(null) cancels immediately. Never use pathfinder.stop() here: it only
     // sets a flag that lingers and kills the *next* goto ("Path was stopped").
@@ -104,6 +112,7 @@ export class Actions {
     this.activity = activity
     this.interruptedBy = activity
     this.following = null
+    if (!reflex) this.claimSeq++
     return ++this.generation
   }
 
@@ -111,6 +120,27 @@ export class Actions {
   private claim (activity: string): number {
     if (this.slotReflex) throw new ActionError(`busy: ${this.slotReflex} (automatic reflex); try again in a few seconds`)
     return this.begin(activity)
+  }
+
+  /**
+   * Counts claims that are not reflexes. Unchanged across a failure means the
+   * action was knocked out by a reflex, not replaced by a newer command, so it
+   * is safe to carry on once the reflex is done.
+   */
+  get claims (): number {
+    return this.claimSeq
+  }
+
+  /** Wait until no reflex holds the slot (true), or give up after `maxMs` (false). */
+  async whenReflexDone (maxMs: number): Promise<boolean> {
+    const until = Date.now() + maxMs
+    while (this.slotReflex && Date.now() < until) await sleep(250)
+    return !this.slotReflex
+  }
+
+  /** Called when a reflex digs in (low health): `text` says where and why. */
+  onHide (fn: (text: string) => void): void {
+    this.hideListeners.push(fn)
   }
 
   /** Bumped whenever something claims the activity slot (read-only for observers). */
@@ -134,7 +164,7 @@ export class Actions {
   /** A reflex takes the activity slot. Remembers a follow so it can resume. */
   preempt (reflex: string): number {
     if (!this.slotReflex) this.resumeFollow = this.following
-    const gen = this.begin(reflex)
+    const gen = this.begin(reflex, true)
     this.slotReflex = reflex
     return gen
   }
@@ -199,6 +229,12 @@ export class Actions {
   /** pathfinder.goto with a deadline; rejects if the slot was taken over. */
   async goto (gen: number, goal: InstanceType<typeof goals.Goal>, timeoutMs: number): Promise<void> {
     const bot = this.bot()
+    // The pathfinder's way up a 1x1 shaft (towering) stalls on this server: dig
+    // stairs out first, but only to go somewhere else (not to mine the block
+    // underfoot or grab a drop in the same shaft), and toward a known target.
+    const to = goalXZ(goal)
+    const me = bot.entity.position
+    if (to && Math.hypot(to.x + 0.5 - me.x, to.z + 0.5 - me.z) >= 3 && climbNeeded(bot) >= 2) await this.climbOut(gen, to)
     let timer: NodeJS.Timeout | undefined
     try {
       await Promise.race([
@@ -250,6 +286,136 @@ export class Actions {
         .map((p) => ({ name: p.username, distance: p.entity ? round(p.entity.position.distanceTo(me)) : null })),
       nearestHostile
     }
+  }
+
+  /** The blocks around the body in words (footing, walls, roof), or null when not in the world. */
+  surroundings (): Surroundings | null {
+    const bot = this.body.bot
+    return bot?.entity ? describeSurroundings(bot) : null
+  }
+
+  /**
+   * Dig in to hide: find natural ground (dirt/stone, not a tree, sand or
+   * gravel) within 16 blocks, stand on it, dig the 3 blocks straight down,
+   * then plug the hole above the head with a block. The body ends up in a
+   * 1x1, 2-high pit with solid walls and a roof. Leaving: any walk (go_to,
+   * come_to_player, follow) digs its way out.
+   */
+  async shelter (asReflex?: string): Promise<string> {
+    const bot = this.bot()
+    if (isEnclosed(bot)) return 'already sheltered: walls on all four sides and a roof overhead'
+    let gen: number
+    if (asReflex) {
+      // The low-health reflex: takes the slot like a fight would.
+      gen = this.preempt(SHELTER_ACTIVITY)
+    } else {
+      // Hiding is wanted exactly when reflexes are busy: wait for a fight or
+      // retreat to end instead of refusing.
+      await this.whenReflexDone(15_000)
+      gen = this.claim(SHELTER_ACTIVITY)
+    }
+    try {
+      const digMs = (b: Block): number => {
+        let best = b.digTime(null, false, false, false, [], bot.entity.effects)
+        for (const it of bot.inventory.items()) best = Math.min(best, b.digTime(it.type, false, false, false, [], bot.entity.effects))
+        return best
+      }
+      const spot = findShelterSpot(bot, 16, digMs)
+      const here = describeSurroundings(bot)
+      if (!spot) throw new ActionError(`no spot to dig in within 16 blocks (need dirt/stone ground 4 deep with solid sides and no water/lava nearby); standing on ${here?.standing_on ?? '?'} (${here?.footing ?? '?'})`)
+      const g = spot.ground
+      if (!this.coverItem(bot) && ![0, 1, 2].some((i) => this.dropsCover(bot, bot.blockAt(g.offset(0, -i, 0))))) {
+        throw new ActionError(`no block to plug the hole with (dirt, cobblestone, planks...) and digging there yields none; have: ${this.inventoryList()}`)
+      }
+      const stand = g.offset(0, 1, 0)
+      if (!bot.entity.position.floored().equals(stand)) {
+        await this.goto(gen, new goals.GoalBlock(stand.x, stand.y, stand.z), 30_000)
+      }
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      bot.pathfinder.setGoal(null)
+      bot.clearControlStates()
+      if (!bot.entity.position.floored().equals(stand)) throw new ActionError(`couldn't get onto the spot at ${fmtPos(stand)}`)
+      // Center on the block: a hitbox overlapping the next block would leave
+      // the body standing on the pit's edge instead of falling in.
+      await this.centerOn(gen, stand)
+      await bot.lookAt(stand.offset(0.5, -1, 0.5), true)
+
+      for (let i = 0; i < 3; i++) {
+        const cell = g.offset(0, -i, 0)
+        const b = bot.blockAt(cell)
+        if (!this.stillCurrent(gen)) throw this.interrupted()
+        if (b && b.boundingBox !== 'empty') {
+          await this.withHands('equip tool', () => this.equipBestTool(b))
+          try {
+            await bot.dig(b, true)
+          } catch (e) {
+            if (!this.stillCurrent(gen)) throw this.interrupted()
+            throw new ActionError(`digging ${b.name} at ${fmtPos(cell)} failed: ${errText(e)}`)
+          }
+        }
+        // Wait to drop into the cell just dug.
+        const until = Date.now() + 2_500
+        while (Date.now() < until && !(Math.floor(bot.entity.position.y + 0.01) <= cell.y && bot.entity.onGround)) await sleep(50)
+        if (Math.floor(bot.entity.position.y + 0.01) > cell.y) throw new ActionError(`didn't drop into the pit at ${fmtPos(cell)} (now at ${fmtPos(bot.entity.position)})`)
+      }
+      await sleep(300) // let the last drops get picked up
+
+      const cover = this.coverItem(bot)
+      if (!cover) throw new ActionError(`dug a pit at ${fmtPos(g)} but have nothing to plug the top with; have: ${this.inventoryList()}`)
+      const placed = await this.placeIn(gen, cover, g)
+      const sealed = isEnclosed(bot)
+      log('shelter.done', { at: fmtPos(bot.entity.position), cover: placed.name, sealed, reflex: asReflex ?? null })
+      const p = bot.entity.position
+      const out = `dug in at ${fmtPos(p)} and plugged the top with ${placed.name}` +
+        (sealed ? ': walled in with a roof, mobs can\'t reach you. To come out, just walk (go_to, come_to_player, follow_player dig their way out).' : ', but a side is still open; check get_state surroundings.')
+      if (asReflex) for (const fn of this.hideListeners) fn(`${asReflex}: ${out}`)
+      return out
+    } finally {
+      if (asReflex) {
+        // Stay in the hole: don't walk back out after a follow the fight interrupted.
+        this.resumeFollow = null
+        this.release(gen)
+      } else {
+        this.finish(gen)
+      }
+    }
+  }
+
+  /** Step toward the middle of block `cell` until within 0.15 of its center (max ~2 s). */
+  private async centerOn (gen: number, cell: Vec3Like): Promise<void> {
+    const bot = this.bot()
+    const cx = cell.x + 0.5
+    const cz = cell.z + 0.5
+    const off = (): number => Math.hypot(bot.entity.position.x - cx, bot.entity.position.z - cz)
+    const until = Date.now() + 2_000
+    try {
+      while (off() > 0.15 && Date.now() < until) {
+        if (!this.stillCurrent(gen)) throw this.interrupted()
+        await bot.lookAt(bot.entity.position.clone().set(cx, bot.entity.position.y + bot.entity.height, cz), true)
+        bot.setControlState('sneak', true) // slow steps, and never off the edge
+        bot.setControlState('forward', true)
+        await sleep(50)
+        bot.setControlState('forward', false)
+        await sleep(50)
+      }
+    } finally {
+      bot.clearControlStates()
+    }
+  }
+
+  /** A plain block worth spending to plug a hole (never anything falling, like sand). */
+  private coverItem (bot: Bot): string | null {
+    const have = new Set(bot.inventory.items().map((i) => i.name))
+    return COVER_ORDER.flatMap((re) => [...have].filter((n) => re.test(n)))[0] ?? null
+  }
+
+  /** Would digging this block (with what we carry) yield a cover block? */
+  private dropsCover (bot: Bot, b: Block | null): boolean {
+    if (!b) return false
+    const data = bot.registry.blocks[b.type]
+    if (data?.harvestTools && !bot.inventory.items().some((i) => data.harvestTools?.[String(i.type)])) return false
+    const drops = (data?.drops ?? []).map((d) => typeof d === 'number' ? bot.registry.items[d]?.name : undefined)
+    return drops.some((n) => n !== undefined && COVER_ORDER.some((re) => re.test(n)))
   }
 
   say (text: string): string {
@@ -322,10 +488,71 @@ export class Actions {
 
   follow (playerName: string | undefined, distance: number): string {
     const target = this.player(playerName)
-    this.claim(`following ${target.username ?? 'player'}`)
+    if (this.slotReflex) {
+      // Queue it: the reflex resumes a follow when it lets go of the slot.
+      this.resumeFollow = { name: target.username ?? '', distance }
+      return `${this.slotReflex} right now (automatic reflex); will follow ${target.username} as soon as that ends`
+    }
+    const gen = this.claim(`following ${target.username ?? 'player'}`)
     this.following = { name: target.username ?? '', distance }
-    this.bot().pathfinder.setGoal(new goals.GoalFollow(target, distance), true)
+    const bot = this.bot()
+    const go = (): void => { if (this.stillCurrent(gen)) bot.pathfinder.setGoal(new goals.GoalFollow(target, distance), true) }
+    if (climbNeeded(bot) >= 2) {
+      this.climbOut(gen, target.position).then(go, (e: unknown) => log('climb.error', { error: errText(e) }))
+      return `climbing out, then following ${target.username} at ${distance} blocks until told to stop`
+    }
+    go()
     return `following ${target.username} at ${distance} blocks until told to stop`
+  }
+
+  /**
+   * Dig a staircase up out of a pit or shaft (e.g. a shelter), one step at a
+   * time toward `toward`, until a normal step or jump gets out. Max 6 steps.
+   */
+  private async climbOut (gen: number, toward: { x: number, z: number } | null): Promise<void> {
+    const bot = this.bot()
+    const start = bot.entity.position.floored()
+    const dirs: Array<[number, number]> = [[0, -1], [0, 1], [1, 0], [-1, 0]]
+    const safe = (c: Vec3Like, d: [number, number]): boolean => {
+      const n = c.offset(d[0], 0, d[1])
+      for (let dy = 0; dy <= 3; dy++) if (isLiquid(bot.blockAt(n.offset(0, dy, 0)))) return false
+      return !LOOSE.test(bot.blockAt(n.offset(0, 3, 0))?.name ?? '') && !LOOSE.test(bot.blockAt(c.offset(0, 3, 0))?.name ?? '')
+    }
+    const ranked = dirs.filter((d) => safe(start, d)).sort((a, b) => {
+      if (!toward) return 0
+      const da = Math.hypot(start.x + a[0] - toward.x, start.z + a[1] - toward.z)
+      const db = Math.hypot(start.x + b[0] - toward.x, start.z + b[1] - toward.z)
+      return da - db
+    })
+    const d = ranked[0]
+    if (!d) throw new ActionError('stuck in a pit with water, lava or sand on every side; dig out by hand')
+    const dig = async (p: Vec3Like): Promise<void> => {
+      const b = bot.blockAt(p)
+      if (!b || isOpen(b)) return
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      await this.withHands('equip tool', () => this.equipBestTool(b))
+      await bot.dig(b, true)
+    }
+    // Only ways up count now: stepping back down into the pit is no way out.
+    for (let step = 0; step < 6 && climbNeeded(bot, 0) >= 2; step++) {
+      const c = bot.entity.position.floored()
+      const n = c.offset(d[0], 0, d[1])
+      await dig(c.offset(0, 2, 0)) // headroom to jump
+      await dig(n.offset(0, 2, 0))
+      await dig(n.offset(0, 1, 0))
+      if (!isSolidBlock(bot.blockAt(n))) break // no step to stand on: walk on from here
+      const up = n.offset(0, 1, 0)
+      await bot.lookAt(up.offset(0.5, 1.6, 0.5), true)
+      bot.setControlState('forward', true)
+      bot.setControlState('jump', true)
+      const until = Date.now() + 2_500
+      while (Date.now() < until && !bot.entity.position.floored().equals(up)) await sleep(50)
+      bot.clearControlStates()
+      if (!this.stillCurrent(gen)) throw this.interrupted()
+      if (!bot.entity.position.floored().equals(up)) throw new ActionError(`couldn't climb onto ${fmtPos(n)} getting out of the pit`)
+      await this.centerOn(gen, up)
+    }
+    log('climb.out', { from: fmtPos(start), to: fmtPos(bot.entity.position) })
   }
 
   async goTo (x: number, y: number | undefined, z: number, range: number): Promise<string> {
@@ -854,6 +1081,42 @@ type Vec3Like = Bot['entity']['position']
 
 /** Tool tiers, weakest first (for "needs a stone_pickaxe or better"). */
 const PICK_ORDER = ['wooden', 'golden', 'stone', 'copper', 'iron', 'diamond', 'netherite']
+
+/**
+ * How many blocks up the lowest way out of the feet cell is: 1 or less means
+ * walk, jump or drop, 2+ means stuck in a pit (no neighbor column to stand on
+ * within reach). 9 when nothing within 6 up.
+ */
+function climbNeeded (bot: Bot, lowest = -4): number {
+  if (!bot.entity) return 0
+  const f = bot.entity.position.floored()
+  let best = 9
+  for (const [dx, dz] of [[0, -1], [0, 1], [1, 0], [-1, 0]] as const) {
+    // From 4 down (a pillar or ledge is not a pit) to 6 up.
+    for (let y = lowest; y <= 6 && y < best; y++) {
+      const p = f.offset(dx, y, dz)
+      if (isSolidBlock(bot.blockAt(p.offset(0, -1, 0))) && isOpen(bot.blockAt(p)) && isOpen(bot.blockAt(p.offset(0, 1, 0)))) { best = y; break }
+    }
+  }
+  return best
+}
+
+/** The x/z a pathfinder goal aims at, when it has one. */
+function goalXZ (goal: unknown): { x: number, z: number } | null {
+  const g = goal as { x?: unknown, z?: unknown, pos?: { x?: unknown, z?: unknown } }
+  if (typeof g.x === 'number' && typeof g.z === 'number') return { x: g.x, z: g.z } // GoalNear, GoalBlock, GoalNearXZ
+  if (typeof g.pos?.x === 'number' && typeof g.pos.z === 'number') return { x: g.pos.x, z: g.pos.z } // GoalLookAtBlock, GoalPlaceBlock
+  return null // GoalInvert (fleeing) and the like: no target to climb toward
+}
+
+/** Blocks to plug a shelter with, cheapest first. */
+const COVER_ORDER: RegExp[] = [
+  /^(dirt|coarse_dirt|rooted_dirt|netherrack)$/,
+  /^(cobblestone|cobbled_deepslate|stone|deepslate|andesite|diorite|granite|tuff|blackstone|mud|packed_mud)$/,
+  /^[a-z_]+_planks$/,
+  /^(stone_bricks|bricks|sandstone|red_sandstone|terracotta|[a-z_]+_terracotta|moss_block)$/,
+  /^[a-z_]+_log$/
+]
 
 const NEIGHBORS: Array<[number, number, number]> = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]
 

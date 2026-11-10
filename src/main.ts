@@ -80,6 +80,14 @@ cerebellum?.onEvent((e) => {
   }
 })
 
+// The low-health reflex dug in: hold the plan (it would dig straight back
+// out) and tell the brain, which decides when it's safe to come out.
+actions.onHide((text) => {
+  const v = plans.view()
+  if (v?.status === 'active') plans.pause('took shelter (low health)')
+  events.report('sheltered', `${text}${v?.status === 'active' ? ` Plan "${v.goal}" is paused; set_plan the remaining steps when it's safe to come out.` : ''}`)
+})
+
 // Death: the server's death message names the cause; it arrives around the
 // death packet, so wait a moment and use the latest one about us.
 body.on('spawn', (bot) => {

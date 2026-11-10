@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { z } from 'zod'
 import { ActionError, blockPattern, type Actions } from './actions.js'
 import type { Cerebellum } from './cerebellum.js'
+import { countGathered } from './items.js'
 import { log } from './log.js'
 import { checkCraftItem, checkSmeltItem, type ItemCatalog } from './crafting.js'
 import { PlanStepSchema, STEP_KINDS, checkGatherBlocks, describeStep, type PlanStore } from './plan.js'
@@ -52,6 +53,47 @@ async function run (tool: string, args: unknown, fn: () => unknown): Promise<Too
   }
 }
 
+/** How long a tool waits for a reflex (fight, retreat, escape) to finish, each time. */
+const REFLEX_WAIT_MS = 30_000
+/** Most times one tool call carries on after being knocked out by a reflex. */
+const MAX_RESUMES = 6
+
+/**
+ * Run an action that a reflex may get in the way of. Instead of failing with
+ * "busy" or "interrupted by fighting zombie" (which makes the brain sleep and
+ * retry, and trips the client's rejected-call breaker), wait for the reflex to
+ * end and carry on. `attempt(n)` starts the action; n > 0 is a resume, so it
+ * can ask for only the work that's left. A newer command, a stop or a plan
+ * taking the slot still ends the call as before.
+ */
+async function patient<T> (a: Actions, tool: string, attempt: (n: number) => Promise<T>, resume = true): Promise<{ out: T, pauses: string[] }> {
+  const pauses: string[] = []
+  if (a.slotReflex) {
+    pauses.push(a.slotReflex)
+    if (!await a.whenReflexDone(REFLEX_WAIT_MS)) throw new ActionError(`busy: ${a.slotReflex} for over ${REFLEX_WAIT_MS / 1000}s (automatic reflex); try again later`)
+  }
+  for (let n = 0; ; n++) {
+    const p = attempt(n)
+    // The action claims the slot synchronously, before its first await.
+    const mine = a.claims
+    try {
+      return { out: await p, pauses }
+    } catch (e) {
+      const m = e instanceof ActionError ? /^interrupted by (.+)$/.exec(e.message) : null
+      if (!resume || !m || a.claims !== mine || n >= MAX_RESUMES) throw e
+      pauses.push(m[1] ?? 'a reflex')
+      log('mcp.resume', { tool, after: m[1], n: n + 1 })
+      if (!await a.whenReflexDone(REFLEX_WAIT_MS) || a.claims !== mine) throw e
+    }
+  }
+}
+
+function withPauses (out: string, pauses: string[]): string {
+  if (!pauses.length) return out
+  const uniq = [...new Set(pauses)]
+  return `${out} (paused ${pauses.length}x for ${uniq.join(', ')}, then carried on)`
+}
+
 const player = z.string().optional().describe('Minecraft player name; omit for the usual companion player')
 
 function buildServer (d: McpDeps): McpServer {
@@ -59,9 +101,25 @@ function buildServer (d: McpDeps): McpServer {
   const s = new McpServer({ name: 'minecraft-body', version: '0.5.0' })
 
   s.registerTool('get_state', {
-    description: 'Current state of your Minecraft body: position, health/food, oxygen, time of day, current activity and running reflex (e.g. "fighting zombie", "eating bread"), held item, worn armor, inventory, nearby players, the nearest hostile mob, and the current plan (goal, status, step, measured progress).',
+    description: 'Current state of your Minecraft body: position, health/food, oxygen, time of day, current activity and running reflex (e.g. "fighting zombie", "retreating from zombie (low health)", "eating bread"), held item, worn armor, inventory, nearby players, the nearest hostile mob, the current plan (goal, status, step, measured progress), and `surroundings`: what you stand on (ground, tree, sand/gravel, water, air) and the ground below if you are up a tree, what is on each side (open, drop, wall), what is overhead (open sky or a roof), whether you are sheltered, and the most common blocks nearby. Read surroundings before building or digging around yourself: you cannot see, this is your eyes.',
     inputSchema: {}
-  }, async () => run('get_state', {}, () => ({ ...a.state(), plan: planSummary(d) })))
+  }, async () => run('get_state', {}, () => ({ ...a.state(), surroundings: a.surroundings(), plan: planSummary(d) })))
+
+  s.registerTool('shelter', {
+    description: 'Hide from mobs right now: finds natural ground (dirt/stone, not a tree, sand or gravel) within 16 blocks, walks there, digs 3 blocks straight down and plugs the hole above your head, leaving you in a closed 1x1 pit. Use it at night or when hurt instead of digging or placing blocks yourself. Pauses an active plan (resume it with set_plan, or it stays paused). To come out later, just walk: go_to, come_to_player or follow_player dig their way out. Waits until done (~10-30 s).',
+    inputSchema: {}
+  }, async () => run('shelter', {}, async () => {
+    const v = d.plans.view()
+    if (v?.status === 'active') d.plans.pause('sheltering')
+    let out: string
+    try {
+      out = await a.shelter()
+    } catch (e) {
+      if (v?.status === 'active') d.plans.resume()
+      throw e
+    }
+    return v?.status === 'active' ? `${out} Plan "${v.goal}" is paused (it would dig you out); send set_plan again to continue it.` : out
+  }))
 
   s.registerTool('set_plan', {
     description: [
@@ -121,7 +179,10 @@ function buildServer (d: McpDeps): McpServer {
   s.registerTool('come_to_player', {
     description: 'Walk to a player and stop next to them. Waits until arrived (up to 60s).',
     inputSchema: { player, range: z.number().min(1).max(10).default(2) }
-  }, async (args) => run('come_to_player', args, () => a.comeTo(args.player, args.range)))
+  }, async (args) => run('come_to_player', args, async () => {
+    const r = await patient(a, 'come_to_player', () => a.comeTo(args.player, args.range))
+    return withPauses(r.out, r.pauses)
+  }))
 
   s.registerTool('follow_player', {
     description: 'Keep following a player until stop is called or another movement command starts. Returns immediately.',
@@ -131,17 +192,34 @@ function buildServer (d: McpDeps): McpServer {
   s.registerTool('go_to', {
     description: 'Walk to coordinates. Omit y to only reach the x/z column. Waits until arrived (up to 120s).',
     inputSchema: { x: z.number(), y: z.number().optional(), z: z.number(), range: z.number().min(0).max(10).default(1) }
-  }, async (args) => run('go_to', args, () => a.goTo(args.x, args.y, args.z, args.range)))
+  }, async (args) => run('go_to', args, async () => {
+    const r = await patient(a, 'go_to', () => a.goTo(args.x, args.y, args.z, args.range))
+    return withPauses(r.out, r.pauses)
+  }))
 
   s.registerTool('mine_block', {
     description: 'Find the nearest blocks of a type, walk to them, break them and pick up the drops. Use Minecraft ids, e.g. oak_log (chop a tree), birch_log, stone, coal_ore. Waits until done.',
     inputSchema: { block: z.string().min(1), count: z.number().int().min(1).max(64).default(1), max_distance: z.number().int().min(4).max(64).default(32) }
-  }, async (args) => run('mine_block', args, () => a.mineBlock(args.block, args.count, args.max_distance)))
+  }, async (args) => run('mine_block', args, async () => {
+    // A resume asks only for what's still missing (counted by the drop, like a plan's gather step).
+    const before = countGathered(a.state().inventory, args.block)
+    const r = await patient(a, 'mine_block', (n) => {
+      const got = n === 0 ? 0 : Math.max(0, countGathered(a.state().inventory, args.block) - before)
+      return a.mineBlock(args.block, Math.max(1, args.count - got), args.max_distance)
+    })
+    if (!r.pauses.length) return r.out
+    const total = countGathered(a.state().inventory, args.block) - before
+    return withPauses(`gathered ${total} of ${args.count} ${args.block} in all; last stretch: ${r.out}`, r.pauses)
+  }))
 
   s.registerTool('craft', {
     description: 'Craft items from your inventory. Makes missing intermediates itself (logs -> planks -> sticks -> wooden_pickaxe). 3x3 recipes use a crafting table within 16 blocks, or it crafts one from planks and places it next to you. Use Minecraft item ids (stick, crafting_table, wooden_pickaxe, stone_pickaxe, furnace, torch, chest); `*_planks` = planks of whatever wood you carry. On failure it says exactly what is missing. Ingots/charcoal/glass are smelted, not crafted: use smelt. Waits until done.',
     inputSchema: { item: z.string().min(1), count: z.number().int().min(1).max(64).default(1).describe('How many items to end up with MORE than now (e.g. 4 sticks).') }
-  }, async (args) => run('craft', args, () => a.craft(args.item, args.count)))
+  }, async (args) => run('craft', args, async () => {
+    // Wait out a reflex before starting; a craft knocked out halfway isn't re-run (it could overshoot).
+    const r = await patient(a, 'craft', () => a.craft(args.item, args.count), false)
+    return withPauses(r.out, r.pauses)
+  }))
 
   s.registerTool('smelt', {
     description: 'Smelt items in a furnace and take the results: raw_iron -> iron_ingot, raw_gold, raw_copper, *_log -> charcoal, sand -> glass, cobblestone -> stone, raw meat/fish -> cooked. `item` may be the input (raw_iron) or the output (iron_ingot). Uses a furnace within 16 blocks, or crafts one from 8 cobblestone and places it. Fuel comes from your inventory (coal, charcoal, planks, logs) unless you name one. Takes 10 s per item and waits until done (max 24 per call; for more use a plan smelt step).',
@@ -150,7 +228,10 @@ function buildServer (d: McpDeps): McpServer {
       count: z.number().int().min(1).max(24).default(1),
       fuel: z.string().min(1).optional().describe('Fuel item id, e.g. coal or *_planks; omit to pick automatically.')
     }
-  }, async (args) => run('smelt', args, () => a.smelt(args.item, args.count, args.fuel)))
+  }, async (args) => run('smelt', args, async () => {
+    const r = await patient(a, 'smelt', () => a.smelt(args.item, args.count, args.fuel), false)
+    return withPauses(r.out, r.pauses)
+  }))
 
   s.registerTool('place_block', {
     description: 'Place a block from your inventory (torch, crafting_table, furnace, cobblestone to plug a hole...). Give x y z for an exact spot (it walks into reach), or omit them for a free spot with solid ground right next to you.',
@@ -158,7 +239,8 @@ function buildServer (d: McpDeps): McpServer {
   }, async (args) => run('place_block', args, () => {
     const { x, y, z: zz } = args
     if ((x === undefined) !== (y === undefined) || (x === undefined) !== (zz === undefined)) throw new ActionError('give all of x, y, z, or none')
-    return a.placeBlock(args.item, x !== undefined && y !== undefined && zz !== undefined ? { x, y, z: zz } : undefined)
+    const at = x !== undefined && y !== undefined && zz !== undefined ? { x, y, z: zz } : undefined
+    return patient(a, 'place_block', () => a.placeBlock(args.item, at)).then((r) => withPauses(r.out, r.pauses))
   }))
 
   s.registerTool('look_at_player', {
@@ -184,7 +266,10 @@ function buildServer (d: McpDeps): McpServer {
   s.registerTool('give', {
     description: 'Walk to a player and throw them items from your inventory (e.g. give steve 3 oak_log). Waits until done.',
     inputSchema: { item: z.string().min(1), count: z.number().int().min(1).max(2304).default(1), player }
-  }, async (args) => run('give', args, () => a.give(args.item, args.count, args.player)))
+  }, async (args) => run('give', args, async () => {
+    const r = await patient(a, 'give', () => a.give(args.item, args.count, args.player))
+    return withPauses(r.out, r.pauses)
+  }))
 
   s.registerTool('drop', {
     description: 'Throw items from your inventory on the ground in front of you.',

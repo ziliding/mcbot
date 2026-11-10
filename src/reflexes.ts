@@ -3,10 +3,11 @@ import type { Block } from 'prismarine-block'
 import type { Entity } from 'prismarine-entity'
 import pathfinderPkg from 'mineflayer-pathfinder'
 import type { Vec3 } from 'vec3'
-import type { Actions } from './actions.js'
+import { SHELTER_ACTIVITY, type Actions } from './actions.js'
 import type { Body } from './body.js'
 import { armorUpgrades, attackCooldownMs, bestFood, ownOxygen } from './items.js'
 import { log } from './log.js'
+import { isEnclosed } from './surroundings.js'
 
 const { goals } = pathfinderPkg
 
@@ -20,11 +21,28 @@ const NEUTRAL = new Set(['enderman', 'zombified_piglin', 'piglin', 'creaking', '
 const NEVER_FIGHT = new Set(['iron_golem', 'snow_golem', 'villager', 'wandering_trader', 'warden'])
 /** Mobs minecraft-data types as "mob"/"animal" that attack on sight anyway. */
 const EXTRA_HOSTILE = new Set(['slime', 'magma_cube', 'hoglin', 'phantom'])
+/** Flyers: chasing them on foot is hopeless, so only hit back when they're within reach. */
+const FLYING = new Set(['phantom', 'ghast', 'blaze', 'vex', 'breeze', 'bee'])
+/** Shoot from a distance: running away on open ground just keeps us in their range. */
+const RANGED = new Set(['skeleton', 'stray', 'bogged', 'pillager', 'blaze', 'ghast', 'witch', 'drowned', 'breeze'])
 const ENGAGE_RANGE = 8
 const REACH = 3
 const FIGHT_LIMIT_MS = 30_000
 /** Give up on a target we can't land a hit on for this long (unreachable). */
 const NO_HIT_LIMIT_MS = 12_000
+/** At or below this health, run from mobs instead of fighting them. */
+const RETREAT_HEALTH = 8
+/** At or below this health, don't start fights; only hit back. */
+const CAUTIOUS_HEALTH = 12
+/** Retreating this many times within RETREAT_WINDOW_MS means running isn't working: dig in. */
+const RETREATS_BEFORE_SHELTER = 2
+const RETREAT_WINDOW_MS = 45_000
+/** After a failed reflex shelter (no spot, nothing to plug with), don't try again for this long. */
+const SHELTER_RETRY_MS = 30_000
+/** Mobs this close count as a threat to run from. */
+const THREAT_RANGE = 12
+/** Run until at least this far from the threat. */
+const RETREAT_DISTANCE = 20
 
 interface Fight {
   target: Entity
@@ -52,6 +70,11 @@ type Hazard = 'lava' | 'fire' | 'burning' | 'drowning'
 export class Reflexes {
   private fight: Fight | null = null
   private escaping: Hazard | null = null
+  private retreating = false
+  private nextRetreatAt = 0
+  private retreatStarts: number[] = []
+  private sheltering = false
+  private nextShelterAt = 0
   private eating = false
   private lastHurt: { at: number, source: Entity | null } | null = null
   private ignored = new Map<number, number>()
@@ -72,6 +95,9 @@ export class Reflexes {
     // A new bot after a reconnect: Actions resets the activity slot itself.
     this.fight = null
     this.escaping = null
+    this.retreating = false
+    this.sheltering = false
+    this.retreatStarts = []
     this.eating = false
     bot.on('physicsTick', () => {
       try { this.onTick(bot) } catch (e) { log('reflex.error', { message: e instanceof Error ? e.message : String(e) }) }
@@ -100,6 +126,26 @@ export class Reflexes {
       if (this.fight) this.endFight(`escaping ${hazard}`)
       void this.escape(bot, hazard, water)
       return
+    }
+
+    if (this.retreating || this.sheltering) return
+    // Badly hurt: get away from mobs (a fight in progress included) unless
+    // walled in, where nothing can reach us anyway. If running keeps failing
+    // (chased again and again, or shot at from range), dig in instead.
+    if (bot.health <= RETREAT_HEALTH && now >= this.nextRetreatAt && this.actions.activity !== SHELTER_ACTIVITY) {
+      const threat = this.threat(bot, now)
+      if (threat && !isEnclosed(bot)) {
+        if (this.fight) this.endFight('retreating: low health')
+        this.retreatStarts = this.retreatStarts.filter((t) => now - t < RETREAT_WINDOW_MS)
+        const ranged = RANGED.has(threat.name ?? '')
+        if (now >= this.nextShelterAt && (ranged || this.retreatStarts.length >= RETREATS_BEFORE_SHELTER)) {
+          void this.hide(bot, threat, ranged ? `shot at by ${threat.name}` : `still chased after ${this.retreatStarts.length} retreats`)
+        } else {
+          this.retreatStarts.push(now)
+          void this.retreat(bot, threat)
+        }
+        return
+      }
     }
 
     if (this.fight) { this.fightTick(bot, now); return }
@@ -175,6 +221,63 @@ export class Reflexes {
     }
   }
 
+  /** Sheltered, or busy digging in: don't go chasing mobs. */
+  private hiding (bot: Bot): boolean {
+    return this.actions.activity === SHELTER_ACTIVITY || isEnclosed(bot)
+  }
+
+  // ---- retreating --------------------------------------------------------
+
+  /** Nearest mob worth running from: an aggressive one, a creeper, or whatever just hurt us. */
+  private threat (bot: Bot, now: number): Entity | null {
+    const src = this.lastHurt && now - this.lastHurt.at < 3000 ? this.lastHurt.source : null
+    if (src && isMob(src) && bot.entities[src.id] && src.position.distanceTo(bot.entity.position) <= THREAT_RANGE) return src
+    return nearest(bot, (e) => isAggressive(e) || e.name === 'creeper', THREAT_RANGE)
+  }
+
+  private async retreat (bot: Bot, threat: Entity): Promise<void> {
+    const started = Date.now()
+    const name = threat.name ?? 'mob'
+    this.retreating = true
+    let gen: number | null = null
+    let result = 'ok'
+    try {
+      gen = this.actions.preempt(`retreating from ${name} (low health)`)
+      log('reflex.retreat', { phase: 'start', from: name, distance: round(threat.position.distanceTo(bot.entity.position)), health: bot.health })
+      const p = threat.position
+      await this.actions.goto(gen, new goals.GoalInvert(new goals.GoalNear(p.x, p.y, p.z, RETREAT_DISTANCE)), 12_000)
+    } catch (e) {
+      result = e instanceof Error ? e.message : String(e)
+    } finally {
+      if (gen !== null) this.actions.release(gen)
+      this.retreating = false
+      // Cornered (no path, gave up): defend ourselves for a while instead of
+      // looping; otherwise check again soon, the mob may have followed.
+      this.nextRetreatAt = Date.now() + (result === 'ok' ? 1000 : 8000)
+      log('reflex.retreat', { phase: 'end', from: name, result, health: bot.health, distance: bot.entity && threat.isValid ? round(threat.position.distanceTo(bot.entity.position)) : null, ms: Date.now() - started })
+    }
+  }
+
+  /** Low health and running isn't working: dig a shelter pit (the shelter tool, as a reflex). */
+  private async hide (bot: Bot, threat: Entity, why: string): Promise<void> {
+    const started = Date.now()
+    const name = threat.name ?? 'mob'
+    this.sheltering = true
+    let result = 'ok'
+    log('reflex.shelter', { phase: 'start', from: name, why, distance: round(threat.position.distanceTo(bot.entity.position)), health: bot.health })
+    try {
+      result = await this.actions.shelter(`low health (${round(bot.health)}/20), ${why}`)
+      this.retreatStarts = []
+    } catch (e) {
+      result = e instanceof Error ? e.message : String(e)
+      // No spot or nothing to plug the hole with: go back to running for a while.
+      this.nextShelterAt = Date.now() + SHELTER_RETRY_MS
+    } finally {
+      this.sheltering = false
+      log('reflex.shelter', { phase: 'end', from: name, result, health: bot.health, sealed: bot.entity ? isEnclosed(bot) : false, ms: Date.now() - started })
+    }
+  }
+
   // ---- fighting ----------------------------------------------------------
 
   private pickTarget (bot: Bot, now: number): { entity: Entity, why: Fight['why'] } | null {
@@ -186,13 +289,18 @@ export class Reflexes {
     if (hurt && now - hurt.at < 1500) {
       this.lastHurt = null
       const src = hurt.source
-      if (src && isMob(src) && !NEVER_FIGHT.has(src.name ?? '') && bot.entities[src.id] && src.position.distanceTo(me) <= 16) {
+      // Walled in or digging in: only hit back at what is right there, a chase would dig us out.
+      const reach = this.hiding(bot) || FLYING.has(src?.name ?? '') ? REACH : 16
+      if (src && isMob(src) && !NEVER_FIGHT.has(src.name ?? '') && bot.entities[src.id] && src.position.distanceTo(me) <= reach) {
         return { entity: src, why: 'attacked' }
       }
     }
     if (this.tick % 4 !== 0) return null
+    if (this.hiding(bot)) return null
+    // Hurt: don't go looking for trouble (still hits back above, until the retreat kicks in).
+    if (bot.health <= CAUTIOUS_HEALTH) return null
     for (const [id, until] of this.ignored) if (until < now) this.ignored.delete(id)
-    const e = nearest(bot, (e) => isAggressive(e) && !this.ignored.has(e.id) && Math.abs(e.position.y - me.y) < 4, ENGAGE_RANGE)
+    const e = nearest(bot, (e) => isAggressive(e) && !FLYING.has(e.name ?? '') && !this.ignored.has(e.id) && Math.abs(e.position.y - me.y) < 4, ENGAGE_RANGE)
     return e ? { entity: e, why: 'nearby' } : null
   }
 
@@ -245,7 +353,7 @@ export class Reflexes {
     if (!(bot.food <= 14 || bot.health <= 14)) return
     const urgent = bot.food <= 6 || bot.health <= 8
     if (this.actions.activity.startsWith('mining') && !urgent) return
-    if (nearest(bot, isAggressive, 5)) return
+    if (nearest(bot, isAggressive, 5) && !isEnclosed(bot)) return
     const food = bestFood(bot, bot.food <= 4)
     if (!food) {
       // Re-check often (someone may hand us food) but log only once.

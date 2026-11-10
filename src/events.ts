@@ -14,7 +14,7 @@ import { log } from './log.js'
  * of one merged message (counted as "+N earlier").
  */
 
-export type EventType = 'plan_done' | 'step_infeasible' | 'step_failed' | 'low_confidence' | 'died' | 'notable_find'
+export type EventType = 'plan_done' | 'step_infeasible' | 'step_failed' | 'low_confidence' | 'died' | 'notable_find' | 'sheltered'
 
 const LABEL: Record<EventType, string> = {
   plan_done: 'plan complete',
@@ -22,7 +22,8 @@ const LABEL: Record<EventType, string> = {
   step_failed: 'step failed',
   low_confidence: 'unsure',
   died: 'died',
-  notable_find: 'notable find'
+  notable_find: 'notable find',
+  sheltered: 'took shelter'
 }
 
 export interface EventReporterConfig {
