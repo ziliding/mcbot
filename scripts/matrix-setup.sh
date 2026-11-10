@@ -2,9 +2,9 @@
 # One-time Matrix setup for the bot. Run it yourself from the repo root:
 #   scripts/matrix-setup.sh
 #
-# The "brain" is a Hermes profile (PERSONA, default nova). The bot's body has
-# its own persona-neutral account, so you can swap brains without a new one:
-#   PERSONA=luna scripts/matrix-setup.sh
+# The "brain" is a Hermes profile (PERSONA, required). The bot's body has its
+# own persona-neutral account, so you can swap brains without a new one:
+#   PERSONA=nova SERVER_NAME=example.com scripts/matrix-setup.sh
 #
 # 1. Registers the body's account (default @mcbot) with the homeserver's
 #    registration token, or logs in if it already exists.
@@ -16,13 +16,13 @@
 # Nothing secret is printed. Needs curl and jq.
 set -euo pipefail
 
-PERSONA="${PERSONA:-nova}"
+PERSONA="${PERSONA:?set PERSONA to the Hermes profile that is the brain of the bot, e.g. PERSONA=nova}"
 HS="${HS:-http://127.0.0.1:6167}"
-SERVER_NAME="${SERVER_NAME:-example.com}"
+SERVER_NAME="${SERVER_NAME:?set SERVER_NAME to the server name of your homeserver, e.g. SERVER_NAME=example.com}"
 HERMES_ENV="${HERMES_ENV:-$HOME/.hermes/profiles/$PERSONA/.env}"
-HERMES_ID="${HERMES_ID:-$(grep -E '^MATRIX_USER_ID=' "$HERMES_ENV" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+HERMES_ID="${HERMES_ID:-$(grep -E '^MATRIX_USER_ID=' "$HERMES_ENV" 2>/dev/null | tail -1 | cut -d= -f2- || true)}"
 HERMES_ID="${HERMES_ID:-@$PERSONA:$SERVER_NAME}"
-HUMAN_ID="${HUMAN_ID:-@you:$SERVER_NAME}"
+HUMAN_ID="${HUMAN_ID:-}"
 TUWUNEL_CONTAINER="${TUWUNEL_CONTAINER:-matrix-tuwunel-1}"
 BOT_ENV="${BOT_ENV:-.env}"
 
@@ -93,7 +93,10 @@ api PUT "/profile/$(jq -rn --arg x "$BOT_ID" '$x|@uri')/displayname" '{"displayn
 
 echo "== Room"
 INVITE=("$HERMES_ID")
-if confirm "Invite yourself ($HUMAN_ID) too, so you can watch and talk in the room?"; then
+if [[ -z "$HUMAN_ID" ]]; then
+  read -r -p "Your own Matrix id, to watch and talk in the room (e.g. @you:$SERVER_NAME; empty to skip): " HUMAN_ID
+fi
+if [[ -n "$HUMAN_ID" ]] && confirm "Invite yourself ($HUMAN_ID) too, so you can watch and talk in the room?"; then
   INVITE+=("$HUMAN_ID")
   GROUP=1
 else

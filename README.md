@@ -270,19 +270,19 @@ Still to check in game with a real player: a long plan with steve actually walki
 ## Setup
 
 1. Add the keys from `.env.example` to your `.env` (including `JEV_API` for the cerebellum). On a fresh checkout, copy it instead. Set `MC_EULA=TRUE` only after reading the EULA.
-2. Matrix (one time): run `scripts/matrix-setup.sh` from the repo root. The brain is a Hermes profile, `PERSONA`, which defaults to `nova`. To use another, run `PERSONA=luna scripts/matrix-setup.sh`. The script:
-   - registers the body's **own**, persona-neutral account, `@mcbot:example.com`. It refuses any account a Hermes profile already uses, such as `@nova` or `@luna`.
-   - creates an **unencrypted** room (the bridge can't read E2EE) and invites the persona (`@nova`) and, optionally, you.
+2. Matrix (one time): run `scripts/matrix-setup.sh` from the repo root. The brain is a Hermes profile, named by `PERSONA`, and `SERVER_NAME` is your homeserver's server name. Both are required, e.g. `PERSONA=nova SERVER_NAME=example.com scripts/matrix-setup.sh`. The script:
+   - registers the body's **own**, persona-neutral account, `@mcbot:example.com`. It refuses any account a Hermes profile already uses, such as `@nova`.
+   - creates an **unencrypted** room (the bridge can't read E2EE) and invites the persona (`@nova`) and, optionally, you (it asks for your Matrix id, or set `HUMAN_ID`).
    - writes `MATRIX_ACCESS_TOKEN`, `MATRIX_ROOM` and `MATRIX_ALLOWED_SENDERS=<persona id>` into `.env`.
    - optionally updates `~/.hermes/profiles/<persona>/.env` (after a backup):
      - adds the bot to `MATRIX_ALLOWED_USERS`.
      - if the room has 3 members, adds it to `MATRIX_FREE_RESPONSE_ROOMS`. Hermes otherwise only replies to @-mentions in group rooms, and a 2-member room counts as a DM.
      - optionally sets `MATRIX_SESSION_SCOPE=room`, so the room is one continuous session rather than a thread per message. This applies to all of the persona's group rooms.
 
-   Switching personas later: re-run the script with the new `PERSONA`. It logs into the existing `@mcbot` and makes a new room. Also set `MC_NAME` in `.env` to match; the in-game name is currently `mcbot`.
+   Switching personas later: re-run the script with the new `PERSONA`. It logs into the existing `@mcbot` and makes a new room. Also set `MC_NAME` in `.env` to match; the in-game name defaults to `mcbot`.
 
    Then restart the Hermes gateway, and accept the room invite in Element.
-3. Persona and memory live in Hermes, not in this repo. Set up how luna behaves in the Minecraft room on the Hermes side.
+3. Persona and memory live in Hermes, not in this repo. Set up how the persona behaves in the Minecraft room on the Hermes side.
 4. `docker compose up -d --build`, then join `localhost:25565` with a 26.1 client.
 5. The server is private: the port only listens on 127.0.0.1, and a whitelist is enforced. To allow a player, run `scripts/whitelist.sh steve mcbot <other names...>`, listing everyone who should be allowed. It rewrites the whole list with offline-mode uuids. Don't use `/whitelist add` or itzg's `WHITELIST` env var: both store Mojang uuids, which never match on this offline server. Keep the bot's `MC_NAME` in the list.
 
