@@ -1,4 +1,4 @@
-# uta-mcbot
+# mcbot
 
 A Minecraft companion bot. Mineflayer controls the body in game, and a Matrix room carries the conversation with Hermes.
 The full design (brain / cerebellum / reflexes, milestones M1–M6) is in the implementation plan. Status: **M1 (conversation round trip), M2 (MCP over HTTP in the same process), M3 (reflexes: fight, eat, escape water/lava/fire, wear armor) and M4 (cerebellum: Jev-driven behavior loop over typed plans, plus local chat triage) and M5 (brain → cerebellum: `set_plan`/`get_plan`/`clear_plan` MCP tools for Hermes, and rate-limited `[EVENT]` escalations into the room) are done, plus crafting, smelting and block placement (`craft`, `smelt`, `place_block`, and `craft`/`smelt` plan steps), and surroundings, shelter and low-health retreat (`get_state.surroundings`, `shelter`).** M6 (ops/observability: traces, reconnect hardening) is next.
